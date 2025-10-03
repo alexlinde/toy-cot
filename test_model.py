@@ -13,9 +13,10 @@ import threading
 
 from shapes import ShapeGenerator
 from text import SimpleTokenizer, TextProcessor
-from model import ToyVLM, DEVICE, generate_response
+from model import ToyVLM, generate_response
 from shapes import ObjType, ObjSize
 import random
+from runtime import setup_runtime
 
 def get_model_stats(model):
     """Get comprehensive model statistics."""
@@ -42,7 +43,7 @@ def get_model_stats(model):
         'vocab_size': model.output_projection.out_features,
         'hidden_dim': model.token_embedding.embedding_dim,
         'num_layers': len(model.transformer_blocks),
-        'num_heads': model.transformer_blocks[0].self_attention.num_heads,
+        'num_heads': getattr(model.transformer_blocks[0].attn, 'num_heads', None),
         'device': str(next(model.parameters()).device),
         'model_size_mb': model_size_mb
     }
@@ -65,10 +66,26 @@ class ToyVLMGUI:
         self.text_processor = TextProcessor()
         self.text_processor.tokenizer = self.tokenizer
 
+        # Setup runtime (device/AMP)
+        self.runtime = setup_runtime()
+
         # Initialize model components (with CoT support: 6 layers)
         self.model = ToyVLM(self.text_processor)
-        self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-        self.model.to(DEVICE)
+
+        # Cross-device safe load (e.g., trained on CUDA/bf16, run on MPS/CPU)
+        try:
+            try:
+                state = torch.load(model_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                state = torch.load(model_path, map_location="cpu")
+            self.model.load_state_dict(state)
+        except FileNotFoundError:
+            print(f"Warning: Model weights not found at '{model_path}'. Using untrained model.")
+        except Exception as e:
+            print(f"Warning: Failed to load weights from '{model_path}': {e}. Using untrained model.")
+
+        # Move to target device and eval
+        self.model = self.runtime["to_device"](self.model)
         self.model.eval()
 
         self.shape_generator = ShapeGenerator()
@@ -238,7 +255,7 @@ class ToyVLMGUI:
     def generate_new_shape(self):
         """Generate a new multi-shape RGB image and update the display."""
         # Generate multi-shape RGB image with metadata
-        num_shapes = random.randint(1, 4)
+        num_shapes = random.randint(1, 8)
         self.current_image, self.current_metadata = self.shape_generator.generate_multi_shape_image(
             num_shapes, add_noise=bool(self.noise_var.get())
         )
@@ -331,8 +348,10 @@ class ToyVLMGUI:
         image_tensor = torch.from_numpy(self.current_image).unsqueeze(0).float() / 255.0
 
         # Generate response with chain-of-thought
-        rationale, answer = generate_response(self.model, image_tensor, question,
-                                               max_length=35, return_rationale=True)
+        with self.runtime["autocast"]:
+            rationale, answer = generate_response(
+                self.model, image_tensor, question, max_length=35, return_rationale=True
+            )
 
         # Format response based on show_rationale setting
         if self.show_rationale_var.get() and rationale:
