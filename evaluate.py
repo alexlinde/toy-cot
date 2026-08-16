@@ -62,10 +62,24 @@ class VLMEvaluator:
     def exact_match(self, predicted: str, ground_truth: str) -> bool:
         return self.normalize_answer(predicted) == self.normalize_answer(ground_truth)
 
-    def _make_scene(self) -> Tuple[Any, List[Dict[str, Any]]]:
-        num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
-        image, metadata = self.shape_gen.generate_multi_shape_image(num_shapes, add_noise=False)
-        return image, metadata
+    def _make_scene(self, target_n: int = None) -> Tuple[Any, List[Dict[str, Any]]]:
+        """Generate a scene; with target_n, retry toward that ACTUAL object count.
+
+        Rejection sampling under-delivers on dense scenes, so unstratified draws
+        would leave high-N accuracy buckets nearly empty. Best effort: return the
+        closest-achieved scene after a bounded number of tries.
+        """
+        if target_n is None:
+            num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
+            return self.shape_gen.generate_multi_shape_image(num_shapes, add_noise=False)
+        best = None
+        for _ in range(30):
+            image, metadata = self.shape_gen.generate_multi_shape_image(target_n, add_noise=False)
+            if len(metadata) == target_n:
+                return image, metadata
+            if best is None or abs(len(metadata) - target_n) < abs(len(best[1]) - target_n):
+                best = (image, metadata)
+        return best
 
     def generate_test_set(self, qtype: str, generator_fn, num_samples: int) -> List[Dict[str, Any]]:
         """Generate a test set of `num_samples` for a single question type,
@@ -78,7 +92,11 @@ class VLMEvaluator:
 
         while len(test_samples) < num_samples and attempts < max_attempts:
             attempts += 1
-            image, metadata = self._make_scene()
+            # Stratify scene density: cycle target N over 1..MAX_OBJECTS so
+            # accuracy-vs-N buckets all get samples (per-N accuracy is
+            # conditional on N, so the changed marginal doesn't bias it).
+            target_n = MIN_OBJECTS + (len(test_samples) % (MAX_OBJECTS - MIN_OBJECTS + 1))
+            image, metadata = self._make_scene(target_n)
             question, answer, rationale = generator_fn(metadata)
             if question is None or answer is None or rationale is None:
                 continue
@@ -161,6 +179,7 @@ class VLMEvaluator:
                 'predicted_rationale': pred_rationale,
                 'correct': is_correct,
                 'rationale_correct': is_rationale_correct,
+                'n_objects': len(sample['metadata']),
             })
 
             if i < show_examples:
@@ -178,6 +197,17 @@ class VLMEvaluator:
         majority_count = Counter(self.normalize_answer(a) for a in gt_answers).most_common(1)
         majority_baseline = (majority_count[0][1] / total) if total > 0 and majority_count else 0.0
 
+        # Accuracy vs scene object count (the crossover-curve data): 2-object bins
+        by_n: Dict[str, Dict[str, Any]] = {}
+        for r in results:
+            lo = ((r['n_objects'] - 1) // 2) * 2 + 1
+            key = f"{lo}-{lo + 1}"
+            b = by_n.setdefault(key, {'n': 0, 'correct': 0})
+            b['n'] += 1
+            b['correct'] += int(r['correct'])
+        for b in by_n.values():
+            b['accuracy'] = b['correct'] / b['n']
+
         metrics = {
             'type': qtype,
             'n': total,
@@ -186,6 +216,8 @@ class VLMEvaluator:
             'rationale_exact': rationale_exact,
             'empty': empty_predictions,
             'errors': generation_errors,
+            'by_n': {k: {'n': v['n'], 'accuracy': v['accuracy']}
+                     for k, v in sorted(by_n.items(), key=lambda kv: int(kv[0].split('-')[0]))},
         }
 
         return metrics, results
@@ -302,6 +334,19 @@ def print_summary(
         )
 
     print(f"\n{'=' * 72}")
+    print("ACCURACY BY SCENE OBJECT COUNT (crossover-curve data)")
+    print('=' * 72)
+    bins = sorted({b for m in per_type_metrics.values() for b in m.get('by_n', {})},
+                  key=lambda k: int(k.split('-')[0]))
+    print(f"{'type':28s} " + " ".join(f"{b:>8s}" for b in bins))
+    for qtype, m in per_type_metrics.items():
+        cells = []
+        for b in bins:
+            v = m.get('by_n', {}).get(b)
+            cells.append(f"{v['accuracy']:7.1%} " if v else f"{'-':>8s}")
+        print(f"{qtype:28s} " + " ".join(c.strip().rjust(8) for c in cells))
+
+    print(f"\n{'=' * 72}")
     print("SUMMARY BY DIFFICULTY")
     print('=' * 72)
     print(f"{'difficulty':28s} {'n':>5s} {'acc':>8s} {'majority':>10s} {'rat.exact':>10s}")
@@ -330,7 +375,9 @@ def write_results(
     fields = ['type', 'n', 'accuracy', 'majority_baseline', 'rationale_exact', 'empty', 'errors']
     with open(out_path, 'w') as f:
         for m in per_type_metrics.values():
-            f.write(json.dumps({k: m[k] for k in fields}) + '\n')
+            row = {k: m[k] for k in fields}
+            row['by_n'] = m.get('by_n', {})
+            f.write(json.dumps(row) + '\n')
         f.write(json.dumps({k: overall_metrics[k] for k in fields}) + '\n')
 
 

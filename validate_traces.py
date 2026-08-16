@@ -8,19 +8,28 @@ checked:
 
 * each enumerated ``{color} {shape} at row r col c`` names a real object that
   really sits in that quantized cell, and the enumeration is complete and in
-  raster order;
+  the order the question implies (raster order, or the axis order for ordinal
+  questions). Two objects may share a quantized cell, so an enumeration may
+  legitimately repeat a line -- multiplicity is checked per enumerated set;
 * every stated count equals the true count of the filtered set it claims to
   describe (including per-side counts, which is where the old generator lied);
-* every cited witness really satisfies the relation it is cited for;
+* every stated parity and count difference is recomputed from those counts;
+* every cited witness really satisfies the relation it is cited for, and every
+  ``qualifying ...`` line of a compositional chain names an object that really
+  starts a valid chain from that level onwards (re-derived here by a top-down
+  existential search, not by the generator's cascade);
 * the final answer equals the independently recomputed ground truth and is
   consistent with the trace's found / none found step.
 
-It also reports the yes/no answer balance per type and the maximum tokenized
-sequence length, tokenizing with allow_unk=False so any out-of-vocabulary word
-is a hard failure.
+It also reports the yes/no answer balance per type (per chain depth as well),
+the answer spread of the counting / count-difference / ordinal types, the
+achieved scene-density distribution, and the maximum tokenized sequence length,
+tokenizing with allow_unk=False so any out-of-vocabulary word is a hard failure.
+A final stress pass hammers the generators at maximum scene density to prove no
+draw can overflow the model's context.
 
 Usage:
-    python validate_traces.py [--samples 1000] [--seed 0]
+    python validate_traces.py [--samples 1000] [--seed 0] [--stress 65536]
 """
 
 import argparse
@@ -53,6 +62,17 @@ SIZES = [s.value for s in ObjSize]
 SIDES = ['left', 'right', 'top', 'bottom']
 OPPOSITE = {'left': 'right', 'right': 'left', 'top': 'bottom', 'bottom': 'top'}
 RELATIONS = ['above', 'below', 'left of', 'right of']
+ORDINAL_WORDS = ['first', 'second', 'third', 'fourth']
+ORDINAL_RANK = {w: i + 1 for i, w in enumerate(ORDINAL_WORDS)}
+CHAIN_DEPTHS = [2, 3, 4]
+
+# Independent sort keys for "k-th from the {side}".
+AXIS_KEY = {
+    'left': lambda rc: (rc[1], rc[0]),
+    'right': lambda rc: (-rc[1], rc[0]),
+    'top': lambda rc: (rc[0], rc[1]),
+    'bottom': lambda rc: (-rc[0], rc[1]),
+}
 
 Descriptor = Tuple[Optional[str], Optional[str]]  # (color, shape)
 
@@ -111,6 +131,42 @@ def side_holds(m: Dict[str, Any], side: str) -> bool:
     raise ValueError(side)
 
 
+def axis_order(meta: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any]]:
+    """Objects ordered by distance from `side` (total order iff cells distinct)."""
+    key = AXIS_KEY[side]
+    return sorted(meta, key=lambda m: key(cell(m)))
+
+
+def chain_oracle(meta: Sequence[Dict[str, Any]], descs: Sequence[Descriptor],
+                 rels: Sequence[str]):
+    """Top-down existential search over the chain.
+
+    Returns starts(level, obj): True iff `obj` matches descs[level] and objects
+    x(level+1)..x(h+1) exist with rels[i](x_i, x_i+1) all the way to the end.
+    Nothing here mirrors the generator's tail-first cascade: it is the plain
+    reading of "is a D1 r1 the D2 that is r2 the D3 ...".
+    """
+    last = len(descs) - 1
+    cache: Dict[Tuple[int, int], bool] = {}
+
+    def starts(level: int, obj: Dict[str, Any]) -> bool:
+        key = (level, id(obj))
+        if key in cache:
+            return cache[key]
+        # `level` strictly increases with the recursion depth, so no cycles.
+        if not matches(obj, descs[level]):
+            result = False
+        elif level == last:
+            result = True
+        else:
+            result = any(relation(obj, nxt, rels[level]) and starts(level + 1, nxt)
+                         for nxt in meta)
+        cache[key] = result
+        return result
+
+    return starts
+
+
 def phrase_for(a: int, b: int) -> str:
     if a > b:
         return 'greater than'
@@ -150,6 +206,16 @@ DESC = rf"(?:(?:{_COLOR_ALT}) )?(?:{_NOUN_ALT})"
 REL = '|'.join(RELATIONS)
 SIDE = '|'.join(SIDES)
 SIZE = '|'.join(SIZES)
+SHAPE_ALT = '|'.join(SHAPES)
+ORD = '|'.join(ORDINAL_WORDS)
+
+
+def chain_question_pattern(hops: int) -> 're.Pattern':
+    """'is a D1 r1 the D2 that is r2 the D3 ...' with `hops` relations."""
+    pattern = rf"is a ({DESC}) ({REL}) the ({DESC})"
+    pattern += rf" that is ({REL}) the ({DESC})" * (hops - 1)
+    return re.compile(pattern + "$")
+
 
 Q_PATTERNS = {
     'existence': re.compile(rf"is there a ({DESC})$"),
@@ -159,10 +225,15 @@ Q_PATTERNS = {
     'size': re.compile(rf"are there any ({SIZE}) shapes$"),
     'relative_position': re.compile(rf"is a ({DESC}) ({REL}) a ({DESC})$"),
     'side_count_comparison': re.compile(rf"are there more ({DESC}) on the ({SIDE})$"),
+    'parity': re.compile(rf"are there an even number of ({DESC})$"),
     'comparison': re.compile(rf"are there more ({DESC}) than ({DESC})$"),
-    'compositional': re.compile(
-        rf"is a ({DESC}) ({REL}) the ({DESC}) that is ({REL}) the ({DESC})$"),
+    'count_difference': re.compile(
+        rf"what is the difference between the number of ({DESC}) and "
+        rf"the number of ({DESC})$"),
+    'ordinal': re.compile(rf"what shape is ({ORD}) from the ({SIDE})$"),
 }
+Q_PATTERNS.update({f'compositional_h{h}': chain_question_pattern(h)
+                   for h in CHAIN_DEPTHS})
 
 ENUM_STEP = re.compile(
     rf"(?:({SIZE}) )?({_COLOR_ALT}) ({'|'.join(SHAPES)}) at row (\d) col (\d)$")
@@ -174,6 +245,9 @@ COUNT_OF_STEP = re.compile(rf"count of ({DESC}) is (\d+)$")
 COUNT_SIDE_STEP = re.compile(rf"count on ({SIDE}) is (\d+)$")
 EMPTY_STEP = re.compile(rf"no (?:({SIZE}) )?(?:({_COLOR_ALT}) )?({_NOUN_ALT}) found$")
 CMP_STEP = re.compile(r"(\d+) (greater than|less than|equal to) (\d+)$")
+PARITY_STEP = re.compile(r"(\d+) is (even|odd)$")
+DIFF_STEP = re.compile(r"difference is (\d+)$")
+ORDINAL_STEP = re.compile(rf"({ORD}) from ({SIDE}) is ({SHAPE_ALT})$")
 PLAIN_STEPS = {'found', 'none found'}
 
 
@@ -214,7 +288,13 @@ class Cursor:
 
     def enumerate_set(self, objs: Sequence[Dict[str, Any]], desc_or_empty: str,
                       with_size: bool = False):
-        """Consume the enumeration of `objs` (raster order) or the empty step."""
+        """Consume the enumeration of `objs` (in the given order) or the empty step.
+
+        One step is consumed per object, so if two objects share a quantized
+        cell the trace must repeat the line: multiplicity is enforced here,
+        where the set boundaries are known (a whole-trace tally could not tell a
+        repeated cell from an object legitimately enumerated in two sets).
+        """
         if not objs:
             self.expect(f"no {desc_or_empty} found")
             return
@@ -255,6 +335,38 @@ class Cursor:
         if int(m.group(2)) != expected:
             raise SampleError(f"stated count {m.group(2)} for side {side} != true "
                               f"count {expected} in step {step!r}")
+
+    def take_parity(self, n: int):
+        step = self.take()
+        m = PARITY_STEP.fullmatch(step)
+        if not m:
+            raise SampleError(f"expected 'N is even|odd', got {step!r}")
+        if int(m.group(1)) != n:
+            raise SampleError(f"parity stated for {m.group(1)}, true count is {n}")
+        want = 'even' if n % 2 == 0 else 'odd'
+        if m.group(2) != want:
+            raise SampleError(f"{n} called {m.group(2)!r}, it is {want!r}")
+
+    def take_difference(self, a: int, b: int):
+        step = self.take()
+        m = DIFF_STEP.fullmatch(step)
+        if not m:
+            raise SampleError(f"expected 'difference is N', got {step!r}")
+        if int(m.group(1)) != abs(a - b):
+            raise SampleError(f"stated difference {m.group(1)} != |{a} - {b}|")
+
+    def take_ordinal(self, ordinal: str, side: str, shape: str):
+        step = self.take()
+        m = ORDINAL_STEP.fullmatch(step)
+        if not m:
+            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shape}}', "
+                              f"got {step!r}")
+        if m.group(1) != ordinal or m.group(2) != side:
+            raise SampleError(f"step {step!r} answers a different question than "
+                              f"{ordinal!r} from {side!r}")
+        if m.group(3) != shape:
+            raise SampleError(f"step {step!r} names {m.group(3)!r}, the {ordinal} "
+                              f"from the {side} is a {shape}")
 
     def take_comparison(self, a: int, b: int):
         step = self.take()
@@ -306,7 +418,12 @@ class Cursor:
 
 
 def check_step_facts(rationale: str, meta: Sequence[Dict[str, Any]]):
-    """Every step must be well-formed; object steps must name a real object."""
+    """Every step must be well-formed; object steps must name a real object.
+
+    This is the line-level pass: it only asks "does this line describe an object
+    that exists?". How many times a line may appear is a property of the set
+    being enumerated and is checked by Cursor.enumerate_set.
+    """
     for step in rationale.split(' . '):
         if step in PLAIN_STEPS:
             continue
@@ -332,7 +449,8 @@ def check_step_facts(rationale: str, meta: Sequence[Dict[str, Any]]):
                 raise SampleError(f"step {step!r} describes no real object")
             continue
         if any(p.fullmatch(step) for p in (WITNESS_STEP, COUNT_STEP, COUNT_OF_STEP,
-                                           COUNT_SIDE_STEP, EMPTY_STEP, CMP_STEP)):
+                                           COUNT_SIDE_STEP, EMPTY_STEP, CMP_STEP,
+                                           PARITY_STEP, DIFF_STEP, ORDINAL_STEP)):
             continue
         raise SampleError(f"unrecognized rationale step {step!r}")
 
@@ -446,36 +564,103 @@ def check_comparison(q, a, r, meta):
         raise SampleError(f"answer {a!r} != ground truth {want!r}")
 
 
-def check_compositional(q, a, r, meta):
-    m = parse_question('compositional', q)
-    desc_a = parse_desc(m.group(1))
-    rel1 = m.group(2)
-    desc_b = parse_desc(m.group(3))
-    rel2 = m.group(4)
-    desc_c = parse_desc(m.group(5))
+def check_parity(q, a, r, meta):
+    desc = parse_desc(parse_question('parity', q).group(1))
+    objs = select(meta, desc)
+    cur = Cursor(r)
+    cur.enumerate_set(objs, desc_text(desc, True))
+    cur.take_count(len(objs))
+    cur.take_parity(len(objs))
+    cur.expect_end()
+    truth = 'yes' if len(objs) % 2 == 0 else 'no'
+    if a != truth:
+        raise SampleError(f"answer {a!r} != ground truth {truth!r} (count {len(objs)})")
 
-    objs_b, objs_c = select(meta, desc_b), select(meta, desc_c)
-    qualifying = [b for b in objs_b if any(relation(b, c, rel2) for c in objs_c)]
+
+def check_count_difference(q, a, r, meta):
+    m = parse_question('count_difference', q)
+    desc_a, desc_b = parse_desc(m.group(1)), parse_desc(m.group(2))
+    if desc_a == desc_b:
+        raise SampleError("count difference asked between a descriptor and itself")
+    objs_a, objs_b = select(meta, desc_a), select(meta, desc_b)
 
     cur = Cursor(r)
-    cur.enumerate_set(objs_b, desc_text(desc_b, True))
-    cur.enumerate_set(objs_c, desc_text(desc_c, True))
-
-    if not qualifying:
-        cur.expect('none found')
-        cur.expect_end()
-        if a != 'no':
-            raise SampleError(f"answer {a!r} but no {desc_text(desc_b)} qualifies")
-        return
-
-    for b in qualifying:
-        row, col = cell(b)
-        cur.expect(f"qualifying {desc_text(desc_b)} at row {row} col {col}")
-
-    objs_a = select(meta, desc_a)
     cur.enumerate_set(objs_a, desc_text(desc_a, True))
-    truth = any(relation(x, b, rel1) for x in objs_a for b in qualifying)
-    cur.take_verdict(truth, a, objs_a, qualifying, rel1)
+    cur.take_count_of(desc_a, len(objs_a))
+    cur.enumerate_set(objs_b, desc_text(desc_b, True))
+    cur.take_count_of(desc_b, len(objs_b))
+    cur.take_difference(len(objs_a), len(objs_b))
+    cur.expect_end()
+    want = str(abs(len(objs_a) - len(objs_b)))
+    if a != want:
+        raise SampleError(f"answer {a!r} != ground truth {want!r} "
+                          f"({len(objs_a)} vs {len(objs_b)})")
+
+
+def check_ordinal(q, a, r, meta):
+    m = parse_question('ordinal', q)
+    ordinal, side = m.group(1), m.group(2)
+    rank = ORDINAL_RANK[ordinal]
+
+    cells = [cell(o) for o in meta]
+    if len(set(cells)) != len(cells):
+        raise SampleError("ordinal question asked of a scene where two objects "
+                          "share a cell: the axis order is not total")
+    if rank > len(meta):
+        raise SampleError(f"asked for the {ordinal} object of a {len(meta)}-object scene")
+
+    ordered = axis_order(meta, side)
+    cur = Cursor(r)
+    cur.enumerate_set(ordered, plural_of('shape'))
+    truth = ordered[rank - 1]['shape']
+    cur.take_ordinal(ordinal, side, truth)
+    cur.expect_end()
+    if a != truth:
+        raise SampleError(f"answer {a!r} != ground truth {truth!r}")
+
+
+def check_chain(q, a, r, meta, hops: int):
+    """Compositional chain of `hops` relation hops.
+
+    Truth is re-derived by an existential search (chain_oracle); the trace's
+    per-level 'qualifying' lines must name exactly the objects that really start
+    a valid chain at that level, in raster order.
+    """
+    groups = parse_question(f'compositional_h{hops}', q).groups()
+    descs = [parse_desc(groups[i]) for i in range(0, len(groups), 2)]
+    rels = [groups[i] for i in range(1, len(groups), 2)]
+    if len(descs) != hops + 1 or len(rels) != hops:
+        raise SampleError(f"chain question parsed into {len(descs)} descriptors and "
+                          f"{len(rels)} relations, expected {hops + 1}/{hops}")
+    for j in range(1, hops):
+        if descs[j] == descs[j + 1]:
+            raise SampleError(f"chain clause {j} and {j + 1} name the same referent "
+                              f"{desc_text(descs[j])!r}")
+
+    starts = chain_oracle(meta, descs, rels)
+    sets = [select(meta, d) for d in descs]
+
+    cur = Cursor(r)
+    for j in range(1, hops + 1):
+        cur.enumerate_set(sets[j], desc_text(descs[j], True))
+
+    qualifying: List[Dict[str, Any]] = []
+    for j in range(hops - 1, 0, -1):
+        qualifying = [o for o in sets[j] if starts(j, o)]
+        if not qualifying:
+            cur.expect('none found')
+            cur.expect_end()
+            if a != 'no':
+                raise SampleError(f"answer {a!r} but nothing qualifies as the "
+                                  f"{desc_text(descs[j])} of clause {j}")
+            return
+        for o in qualifying:
+            row, col = cell(o)
+            cur.expect(f"qualifying {desc_text(descs[j])} at row {row} col {col}")
+
+    cur.enumerate_set(sets[0], desc_text(descs[0], True))
+    truth = any(starts(0, o) for o in meta)
+    cur.take_verdict(truth, a, sets[0], qualifying, rels[0])
     cur.expect_end()
     want = 'yes' if truth else 'no'
     if a != want:
@@ -489,11 +674,19 @@ CHECKERS = {
     'size': check_size,
     'relative_position': check_relative_position,
     'side_count_comparison': check_side_count_comparison,
+    'parity': check_parity,
     'comparison': check_comparison,
-    'compositional': check_compositional,
+    'count_difference': check_count_difference,
+    'ordinal': check_ordinal,
 }
+CHECKERS.update({
+    f'compositional_h{h}': (lambda hops: lambda q, a, r, meta: check_chain(q, a, r, meta, hops))(h)
+    for h in CHAIN_DEPTHS
+})
 
-YES_NO_TYPES = {name for name in CHECKERS if name != 'counting'}
+# Types whose answer is not yes/no (their spread is reported instead).
+OPEN_ANSWER_TYPES = {'counting', 'count_difference', 'ordinal'}
+YES_NO_TYPES = set(CHECKERS) - OPEN_ANSWER_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +700,55 @@ def difficulty_of(qtype: str) -> str:
     return '?'
 
 
+def numeric_spread(answers: Counter) -> str:
+    """'0:12.3% 1:...' for a Counter whose keys are numeric strings."""
+    total = max(1, sum(answers.values()))
+    return "  ".join(f"{k}:{100.0 * answers[k] / total:.1f}%"
+                     for k in sorted(answers, key=int))
+
+
+def stress_pass(shape_gen, rg, processor, draws: int, max_objects: int
+                ) -> Tuple[int, int, int, List[str]]:
+    """Hammer every generator at maximum scene density.
+
+    Returns (draws made, overflows, declines, problems). A draw that does not
+    fit MAX_SEQ_LEN, or that contains an out-of-vocabulary word, is a hard
+    failure: training tokenizes with allow_unk=False and asserts on overflow.
+    """
+    generators = list(rg.generators.items())
+    scenes = max(1, draws // max(1, len(generators)))
+    made = overflow = declined = 0
+    longest = 0
+    problems: List[str] = []
+
+    for _ in range(scenes):
+        _img, meta = shape_gen.generate_multi_shape_image(max_objects, False)
+        for qtype, generator in generators:
+            question, answer, rationale = generator(meta)
+            made += 1
+            if question is None:
+                declined += 1
+                continue
+            try:
+                input_ids, _t, _r, _a = processor.prepare_input_sequence(
+                    question, answer, rationale)
+            except AssertionError:
+                overflow += 1
+                if overflow <= 3:
+                    problems.append(f"[stress/{qtype}] overflow: q={question!r} "
+                                    f"r={rationale!r}")
+                continue
+            except ValueError as exc:
+                problems.append(f"[stress/{qtype}] out-of-vocabulary word: {exc}")
+                continue
+            longest = max(longest, len(input_ids))
+
+    print(f"stress pass: {made} draws over {scenes} scenes at N={max_objects}, "
+          f"{overflow} overflows, {declined} declines, longest {longest} tokens "
+          f"/ MAX_SEQ_LEN={MAX_SEQ_LEN}")
+    return made, overflow, declined, problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--samples', type=int, default=1000,
@@ -514,6 +756,9 @@ def main() -> int:
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--max-failures', type=int, default=5,
                         help='failures to print per type before summarizing')
+    parser.add_argument('--stress', type=int, default=65536,
+                        help='question draws at maximum scene density in the '
+                             'overflow stress pass (0 disables it)')
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -542,6 +787,8 @@ def main() -> int:
     used_words: set = set()
     rows_seen: Counter = Counter()
     cols_seen: Counter = Counter()
+    scene_sizes: Counter = Counter()
+    shared_cell_scenes = 0
     global_max_len = 0
     longest_sample = None
 
@@ -555,8 +802,11 @@ def main() -> int:
         for _ in range(args.samples):
             num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
             _img, meta = shape_gen.generate_multi_shape_image(num_shapes, False)
-            for obj in meta:
-                row, col = cell(obj)
+            scene_sizes[len(meta)] += 1
+            cells = [cell(obj) for obj in meta]
+            if len(set(cells)) != len(cells):
+                shared_cell_scenes += 1
+            for row, col in cells:
                 rows_seen[row] += 1
                 cols_seen[col] += 1
             question, answer, rationale = generator(meta)
@@ -648,8 +898,20 @@ def main() -> int:
         print(f"  longest ({n} tokens, {qtype}): q={q!r}")
 
     counting_answers = stats['counting']['answers']
-    print(f"counting answer distribution: "
-          f"{sorted(counting_answers.items(), key=lambda kv: int(kv[0]))}")
+    print(f"counting answer distribution:  {numeric_spread(counting_answers)}")
+    print(f"count_difference distribution: "
+          f"{numeric_spread(stats['count_difference']['answers'])}")
+    print(f"ordinal answer distribution:   "
+          f"{dict(sorted(stats['ordinal']['answers'].items()))}")
+
+    total_scenes = sum(scene_sizes.values())
+    print(f"achieved scene density over {total_scenes} scenes "
+          f"(requested uniform {MIN_OBJECTS}..{MAX_OBJECTS}):")
+    print("  " + "  ".join(f"{n}:{100.0 * scene_sizes[n] / total_scenes:.1f}%"
+                           for n in sorted(scene_sizes)))
+    print(f"  mean actual N = "
+          f"{sum(n * c for n, c in scene_sizes.items()) / total_scenes:.2f}"
+          f"   scenes with two objects in one cell: {shared_cell_scenes}")
 
     print(f"grid rows occupied: {sorted(rows_seen)}   cols occupied: {sorted(cols_seen)}"
           f"   (shape margins keep objects off the border cells)")
@@ -677,6 +939,18 @@ def main() -> int:
         problems.append("counting: a count of 0 never occurred")
     if global_max_len > MAX_SEQ_LEN:
         problems.append(f"max sequence length {global_max_len} exceeds {MAX_SEQ_LEN}")
+
+    if args.stress > 0:
+        made, overflow, declined, stress_problems = stress_pass(
+            shape_gen, rg, processor, args.stress, MAX_OBJECTS)
+        failures.extend(stress_problems)
+        if overflow:
+            problems.append(f"{overflow}/{made} stress draws overflow MAX_SEQ_LEN")
+        if any('out-of-vocabulary' in p for p in stress_problems):
+            problems.append("stress pass produced out-of-vocabulary words")
+        if declined > made // 4:
+            problems.append(f"stress pass: {declined}/{made} draws declined at "
+                            f"maximum density")
 
     if failures:
         print("\n" + "=" * 78)

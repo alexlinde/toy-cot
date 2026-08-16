@@ -15,6 +15,11 @@ Trace conventions
 * empty filtered set:    ``no {plural descriptor} found``
 * counts:                ``count is {n}`` / ``count of {desc} is {n}``
                          / ``count on {side} is {n}``
+* parity:                ``{n} is even`` / ``{n} is odd``
+* count difference:      ``difference is {d}``
+* chain resolution:      ``qualifying {desc} at row {r} col {c}``
+                         then ``found`` (yes) or ``none found`` (no)
+* ordinal:               ``{ordinal} from {side} is {shape}``
 
 All spatial ground truth is computed from the quantized grid coordinates
 (shapes.grid_row / shapes.grid_col), never from raw pixel centers.
@@ -23,7 +28,8 @@ All spatial ground truth is computed from the quantized grid coordinates
 import random
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from shapes import COLORS, ObjSize, ObjType, ShapeGenerator, grid_col, grid_row
+from shapes import (COLORS, MAX_OBJECTS, ObjSize, ObjType, ShapeGenerator,
+                    grid_col, grid_row)
 
 # ---------------------------------------------------------------------------
 # Vocabulary-bearing constants
@@ -39,23 +45,33 @@ OPPOSITE_SIDE: Dict[str, str] = {
     'left': 'right', 'right': 'left', 'top': 'bottom', 'bottom': 'top',
 }
 
+# Ordinal words, in rank order: ORDINALS[k - 1] names the k-th object.
+ORDINALS: List[str] = ['first', 'second', 'third', 'fourth']
+
 # Head noun used when a descriptor names only a color ("red shape").
 GENERIC_NOUN = 'shape'
 
+# Compositional chain depths (number of relation hops) that get their own
+# generator, so the evaluator reports one accuracy bucket per depth.
+CHAIN_DEPTHS: List[int] = [2, 3, 4]
+
 DIFFICULTY_MAP: Dict[str, List[str]] = {
     'easy': ['existence', 'positional_existence'],
-    'medium': ['counting', 'size', 'relative_position', 'side_count_comparison'],
-    'hard': ['comparison', 'compositional'],
+    'medium': ['counting', 'size', 'relative_position', 'side_count_comparison',
+               'parity'],
+    'hard': (['comparison']
+             + [f'compositional_h{h}' for h in CHAIN_DEPTHS]
+             + ['count_difference', 'ordinal']),
 }
 
 # Literal template words that are not derivable from the lists above.
 TEMPLATE_WORDS = frozenset({
     # question templates
-    'is', 'a', 'there', 'any', 'are', 'on', 'the', 'how', 'many', 'than',
-    'more', 'that',
+    'is', 'a', 'an', 'there', 'any', 'are', 'on', 'the', 'how', 'many', 'than',
+    'more', 'that', 'what', 'number', 'difference', 'between', 'and', 'from',
     # trace steps
     'at', 'row', 'col', 'count', 'of', 'no', 'none', 'found', 'qualifying',
-    'greater', 'less', 'equal', 'to',
+    'greater', 'less', 'equal', 'to', 'even', 'odd',
     # answers
     'yes',
 })
@@ -65,14 +81,16 @@ TEMPLATE_WORDS = frozenset({
 # ---------------------------------------------------------------------------
 # text.prepare_input_sequence wraps question/rationale/answer in 74 fixed
 # tokens (BOS + <IMG_START> + 64 image tokens + <IMG_END> + <|user|> +
-# <|assistant|> + THINK/FINAL open+close + EOS) inside MAX_SEQ_LEN = 192.
+# <|assistant|> + THINK/FINAL open+close + EOS) inside MAX_SEQ_LEN = 256.
 # Drafts whose word count exceeds this are re-drawn so a training sample can
 # never overflow the model's context.
-WORD_BUDGET = 118
+WORD_BUDGET = 256 - 74  # 182
 
 # Answer-prior balancing: how many times question parameters are re-drawn while
 # trying to hit the coin-flipped target answer.
 BALANCE_ATTEMPTS = 20
+# Deep chains need more tries: a 'yes' needs an actual chain in the scene.
+CHAIN_BALANCE_ATTEMPTS = 40
 
 # Probability that a descriptor is derived from an object actually present in
 # the scene (rather than sampled from the full attribute space). Grounded draws
@@ -83,6 +101,18 @@ COUNTING_GROUNDED_PROB = 0.5
 # Probability that a pair of descriptors is anchored on two different objects
 # of the scene (relational questions need both sets non-empty to ever be true).
 JOINT_DESCRIPTOR_PROB = 0.85
+# Probability that a compositional chain is built backwards from an actual
+# chain of objects in the scene. Unanchored chains are almost always 'no' at
+# depth 3+, so without scene-anchored draws the answer prior collapses.
+CHAIN_ANCHORED_PROB = 0.8
+# Largest |a - b| the count-difference generator aims for. Targets are drawn
+# uniformly from 0..this, which spreads the answers instead of letting them
+# pile up on 0 and 1.
+DIFFERENCE_TARGET_MAX = 6
+DIFFERENCE_ATTEMPTS = 40
+# Share of count-difference draws that deliberately pair a broad descriptor
+# with a narrow one (the only way to reach a large difference).
+DIFFERENCE_SPREAD_PROB = 0.5
 
 
 def pluralize(word: str) -> str:
@@ -147,6 +177,28 @@ def raster_sorted(objs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def filter_objects(metadata_list: Sequence[Dict[str, Any]], desc: Descriptor) -> List[Dict[str, Any]]:
     """All objects matching a descriptor, in raster order."""
     return raster_sorted([m for m in metadata_list if desc.matches(m)])
+
+
+# Sort keys for "k-th from the {side}". The secondary key is the cross-axis,
+# ascending, so the order is total whenever all (row, col) pairs are distinct.
+AXIS_KEY: Dict[str, Callable[[Tuple[int, int]], Tuple[int, int]]] = {
+    'left': lambda rc: (rc[1], rc[0]),
+    'right': lambda rc: (-rc[1], rc[0]),
+    'top': lambda rc: (rc[0], rc[1]),
+    'bottom': lambda rc: (-rc[0], rc[1]),
+}
+
+
+def axis_sorted(objs: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any]]:
+    """Objects ordered by distance from the named side of the canvas."""
+    key = AXIS_KEY[side]
+    return sorted(objs, key=lambda m: key(cell_of(m)))
+
+
+def all_cells_distinct(objs: Sequence[Dict[str, Any]]) -> bool:
+    """True iff no two objects share a quantized cell (ordering is then total)."""
+    cells = [cell_of(m) for m in objs]
+    return len(set(cells)) == len(cells)
 
 
 def relation_holds(a: Dict[str, Any], b: Dict[str, Any], relation: str) -> bool:
@@ -227,8 +279,13 @@ class RationaleGenerator:
             'size': self.generate_size_qa,
             'relative_position': self.generate_relative_position_qa,
             'side_count_comparison': self.generate_side_count_comparison_qa,
+            'parity': self.generate_parity_qa,
             'comparison': self.generate_comparison_qa,
-            'compositional': self.generate_compositional_positional_qa,
+            'compositional_h2': self.generate_compositional_positional_qa,
+            'compositional_h3': self.generate_compositional_h3_qa,
+            'compositional_h4': self.generate_compositional_h4_qa,
+            'count_difference': self.generate_count_difference_qa,
+            'ordinal': self.generate_ordinal_qa,
         }
 
     # ------------------------------------------------------------------
@@ -273,23 +330,21 @@ class RationaleGenerator:
         return (self._draw_descriptor(metadata_list, kinds_a),
                 self._draw_descriptor(metadata_list, kinds_b))
 
-    def _balanced(self, draw: Callable[[], Optional[Tuple[str, str, str]]]) -> Tuple[str, str, str]:
-        """Answer-prior balancing for yes/no questions.
+    def _draw_toward(self, draw: Callable[[], Optional[Tuple[str, str, str]]],
+                     target: str, attempts: int = BALANCE_ATTEMPTS
+                     ) -> Tuple[str, str, str]:
+        """Re-draw question parameters until the computed answer hits `target`.
 
-        Flip a coin for the target answer, then re-draw the question parameters
-        until the computed answer matches it. Drafts that would overflow the
-        sequence budget are never returned unless no fitting draft was found.
+        Only drafts that fit the sequence budget are ever returned: a draft that
+        overflows would make text.prepare_input_sequence assert, so declining
+        (None, None, None) -- which every caller treats as "resample" -- is the
+        only safe fallback.
         """
-        target = 'yes' if random.random() < 0.5 else 'no'
         fallback: Optional[Tuple[str, str, str]] = None
-        last: Optional[Tuple[str, str, str]] = None
 
-        for _ in range(BALANCE_ATTEMPTS):
+        for _ in range(attempts):
             candidate = draw()
-            if candidate is None:
-                continue
-            last = candidate
-            if not _fits(candidate):
+            if candidate is None or not _fits(candidate):
                 continue
             fallback = candidate
             if candidate[1] == target:
@@ -297,9 +352,14 @@ class RationaleGenerator:
 
         if fallback is not None:
             return fallback
-        if last is not None:
-            return last
         return None, None, None
+
+    def _balanced(self, draw: Callable[[], Optional[Tuple[str, str, str]]],
+                  attempts: int = BALANCE_ATTEMPTS) -> Tuple[str, str, str]:
+        """Answer-prior balancing for yes/no questions: flip a coin, then draw
+        toward that answer."""
+        return self._draw_toward(draw, 'yes' if random.random() < 0.5 else 'no',
+                                 attempts)
 
     # ------------------------------------------------------------------
     # Small counting utilities (kept for external convenience)
@@ -514,72 +574,248 @@ class RationaleGenerator:
         return self._balanced(draw)
 
     # ------------------------------------------------------------------
-    # 8. compositional (hard)
+    # 8. compositional chains, depth h = 2, 3, 4 (hard)
     # ------------------------------------------------------------------
 
-    def generate_compositional_positional_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'is a circle left of the red square that is above the blue cross'
+    @staticmethod
+    def _walk_chain(metadata_list: Sequence[Dict[str, Any]], hops: int
+                    ) -> Optional[List[Dict[str, Any]]]:
+        """A chain of objects x1..x(h+1) that really satisfies some relation at
+        every hop -- the scene anchor that a 'yes' answer is built from.
 
-        Yes iff some B-object has a C-object in relation rel2 *and* some
-        A-object in relation rel1 to it.
+        The chain-existence semantics never asks the objects to be distinct, so
+        the walk may revisit an object; only *adjacent* objects must differ in
+        color+shape, because adjacent descriptors have to differ.
         """
+        objs = [random.choice(list(metadata_list))]
+        for step in range(hops):
+            prev = objs[-1]
+            pool = [m for m in metadata_list
+                    if cell_of(m) != cell_of(prev)  # else no relation holds
+                    and (step == 0
+                         or (m['color'], m['shape']) != (prev['color'], prev['shape']))]
+            if not pool:
+                return None
+            objs.append(random.choice(pool))
+        return objs
+
+    def _draw_chain(self, metadata_list: Sequence[Dict[str, Any]], hops: int
+                    ) -> Optional[Tuple[List[Descriptor], List[str]]]:
+        """Draw descriptors D1..D(h+1) and relations r1..rh for a chain question.
+
+        With probability CHAIN_ANCHORED_PROB the chain is read off an actual
+        chain of objects in the scene (relations are picked among those that
+        really hold), which is what makes a 'yes' reachable at depth 3 and 4.
+        """
+        # D2..D(h+1) are always color+shape: it keeps every enumeration short
+        # and each clause unambiguous about the object it refers to.
+        anchor = (self._walk_chain(metadata_list, hops)
+                  if random.random() < CHAIN_ANCHORED_PROB else None)
+        if anchor is not None:
+            relations = []
+            for x, y in zip(anchor, anchor[1:]):
+                holding = [r for r in RELATIONS if relation_holds(x, y, r)]
+                if not holding:  # x and y share a cell: no relation holds
+                    return None
+                relations.append(random.choice(holding))
+            descs = [self._descriptor_from(anchor[0]['color'], anchor[0]['shape'],
+                                           ('shape', 'color_shape', 'color'))]
+            descs += [Descriptor(o['color'], o['shape']) for o in anchor[1:]]
+        else:
+            descs = [self._draw_descriptor(metadata_list)]
+            descs += [self._draw_descriptor(metadata_list, kinds=('color_shape',))
+                      for _ in range(hops)]
+            relations = [random.choice(RELATIONS) for _ in range(hops)]
+
+        # Adjacent referents must differ, as in the original 2-hop question
+        # ("the red square that is above the red square" refers to nothing).
+        if any(descs[j] == descs[j + 1] for j in range(1, len(descs) - 1)):
+            return None
+        return descs, relations
+
+    @staticmethod
+    def _chain_question(descs: Sequence[Descriptor], relations: Sequence[str]) -> str:
+        """'is a D1 r1 the D2 that is r2 the D3 that is r3 the D4'."""
+        question = f"is a {descs[0].text()} {relations[0]} the {descs[1].text()}"
+        for i in range(1, len(relations)):
+            question += f" that is {relations[i]} the {descs[i + 1].text()}"
+        return question
+
+    def _chain_trace(self, metadata_list: Sequence[Dict[str, Any]],
+                     descs: Sequence[Descriptor], relations: Sequence[str]
+                     ) -> Tuple[str, str]:
+        """Resolve the chain from the tail and return (rationale, answer).
+
+        The answer is 'yes' iff objects x1..x(h+1) exist with xi matching Di and
+        r_i(x_i, x_i+1) for every i. The trace enumerates D2..D(h+1), then walks
+        back down the chain listing the objects that still qualify at each level,
+        and finally cites a witness for the first hop.
+        """
+        hops = len(relations)
+        sets = [filter_objects(metadata_list, d) for d in descs]
+
+        steps: List[str] = []
+        for j in range(1, hops + 1):
+            steps += enumeration_steps(sets[j], f"no {descs[j].text(True)} found")
+
+        # At loop index j, `qualifying` holds the objects matching descs[j] that
+        # start a valid chain from level j all the way to the end.
+        qualifying = [b for b in sets[hops - 1]
+                      if any(relation_holds(b, c, relations[hops - 1])
+                             for c in sets[hops])]
+        for j in range(hops - 1, 0, -1):
+            if not qualifying:
+                steps.append('none found')
+                return ' . '.join(steps), 'no'
+            for b in qualifying:
+                row, col = cell_of(b)
+                steps.append(f"qualifying {descs[j].text()} at row {row} col {col}")
+            if j == 1:
+                break
+            qualifying = [b for b in sets[j - 1]
+                          if any(relation_holds(b, c, relations[j - 1])
+                                 for c in qualifying)]
+
+        steps += enumeration_steps(sets[0], f"no {descs[0].text(True)} found")
+
+        witness = None
+        for a in sets[0]:
+            for b in qualifying:
+                if relation_holds(a, b, relations[0]):
+                    witness = (a, b)
+                    break
+            if witness is not None:
+                break
+
+        if witness is None:
+            steps.append('none found')
+            return ' . '.join(steps), 'no'
+
+        steps.append(witness_step(witness[0], witness[1], relations[0]))
+        steps.append('found')
+        return ' . '.join(steps), 'yes'
+
+    def generate_chain_qa(self, metadata_list: List[Dict[str, Any]], hops: int
+                          ) -> Tuple[str, str, str]:
+        """Compositional chain question with `hops` relation hops."""
         if not metadata_list:
             return None, None, None
 
         def draw():
-            # B and C are always color+shape: it keeps the trace short and the
-            # question unambiguous about which object the clause refers to.
-            desc_b, desc_c = self._draw_descriptor_pair(
-                metadata_list, kinds_a=('color_shape',), kinds_b=('color_shape',))
-            if desc_b == desc_c:
+            drawn = self._draw_chain(metadata_list, hops)
+            if drawn is None:
                 return None
-            desc_a = self._draw_descriptor(metadata_list)
-            rel1 = random.choice(RELATIONS)
-            rel2 = random.choice(RELATIONS)
+            descs, relations = drawn
+            rationale, answer = self._chain_trace(metadata_list, descs, relations)
+            return self._chain_question(descs, relations), answer, rationale
 
-            objs_b = filter_objects(metadata_list, desc_b)
-            objs_c = filter_objects(metadata_list, desc_c)
+        return self._balanced(draw, attempts=CHAIN_BALANCE_ATTEMPTS)
 
-            steps = enumeration_steps(objs_b, f"no {desc_b.text(True)} found")
-            steps += enumeration_steps(objs_c, f"no {desc_c.text(True)} found")
+    def generate_compositional_positional_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """'is a circle left of the red square that is above the blue cross' (h=2)."""
+        return self.generate_chain_qa(metadata_list, 2)
 
-            qualifying = [b for b in objs_b
-                          if any(relation_holds(b, c, rel2) for c in objs_c)]
+    def generate_compositional_h3_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        return self.generate_chain_qa(metadata_list, 3)
 
-            question = (f"is a {desc_a.text()} {rel1} the {desc_b.text()} "
-                        f"that is {rel2} the {desc_c.text()}")
+    def generate_compositional_h4_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        return self.generate_chain_qa(metadata_list, 4)
 
-            if not qualifying:
-                steps.append('none found')
-                return question, 'no', ' . '.join(steps)
+    # ------------------------------------------------------------------
+    # 9. parity (medium)
+    # ------------------------------------------------------------------
 
-            for b in qualifying:
-                row, col = cell_of(b)
-                steps.append(f"qualifying {desc_b.text()} at row {row} col {col}")
+    def generate_parity_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """'are there an even number of red circles' -- count, then read parity."""
+        if not metadata_list:
+            return None, None, None
 
-            objs_a = filter_objects(metadata_list, desc_a)
-            steps += enumeration_steps(objs_a, f"no {desc_a.text(True)} found")
-
-            witness = None
-            for a in objs_a:
-                for b in qualifying:
-                    if relation_holds(a, b, rel1):
-                        witness = (a, b)
-                        break
-                if witness is not None:
-                    break
-
-            if witness is not None:
-                steps.append(witness_step(witness[0], witness[1], rel1))
-                steps.append('found')
-                answer = 'yes'
-            else:
-                steps.append('none found')
-                answer = 'no'
-
-            return question, answer, ' . '.join(steps)
+        def draw():
+            desc = self._draw_descriptor(metadata_list,
+                                         grounded_prob=COUNTING_GROUNDED_PROB)
+            objs = filter_objects(metadata_list, desc)
+            n = len(objs)
+            steps = enumeration_steps(objs, f"no {desc.text(True)} found")
+            steps.append(f"count is {n}")
+            steps.append(f"{n} is {'even' if n % 2 == 0 else 'odd'}")
+            return (f"are there an even number of {desc.text(True)}",
+                    'yes' if n % 2 == 0 else 'no',
+                    ' . '.join(steps))
 
         return self._balanced(draw)
+
+    # ------------------------------------------------------------------
+    # 10. count difference (hard)
+    # ------------------------------------------------------------------
+
+    def generate_count_difference_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """'what is the difference between the number of circles and the number
+        of red shapes' -- two scoped counts, then their absolute difference."""
+        if not metadata_list:
+            return None, None, None
+
+        def draw():
+            # Half the draws pair a broad, scene-grounded descriptor with a
+            # narrow (often absent) one: that is what makes a difference bigger
+            # than one or two reachable at all. The rest are drawn like any
+            # other counting question, to keep the question surface varied.
+            if random.random() < DIFFERENCE_SPREAD_PROB:
+                desc_a = self._draw_descriptor(metadata_list, kinds=('shape', 'color'),
+                                               grounded_prob=0.9)
+                desc_b = self._draw_descriptor(metadata_list, kinds=('color_shape',),
+                                               grounded_prob=0.3)
+            else:
+                desc_a = self._draw_descriptor(metadata_list,
+                                               grounded_prob=COUNTING_GROUNDED_PROB)
+                desc_b = self._draw_descriptor(metadata_list,
+                                               grounded_prob=COUNTING_GROUNDED_PROB)
+            if desc_a == desc_b:
+                return None
+
+            objs_a = filter_objects(metadata_list, desc_a)
+            objs_b = filter_objects(metadata_list, desc_b)
+            count_a, count_b = len(objs_a), len(objs_b)
+
+            steps = enumeration_steps(objs_a, f"no {desc_a.text(True)} found")
+            steps.append(f"count of {desc_a.text(True)} is {count_a}")
+            steps += enumeration_steps(objs_b, f"no {desc_b.text(True)} found")
+            steps.append(f"count of {desc_b.text(True)} is {count_b}")
+            steps.append(f"difference is {abs(count_a - count_b)}")
+
+            return (f"what is the difference between the number of "
+                    f"{desc_a.text(True)} and the number of {desc_b.text(True)}",
+                    str(abs(count_a - count_b)),
+                    ' . '.join(steps))
+
+        return self._draw_toward(draw, str(random.randint(0, DIFFERENCE_TARGET_MAX)),
+                                 attempts=DIFFERENCE_ATTEMPTS)
+
+    # ------------------------------------------------------------------
+    # 11. ordinal (hard)
+    # ------------------------------------------------------------------
+
+    def generate_ordinal_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """'what shape is third from the left' -- enumerate along the axis, then
+        read off the k-th object.
+
+        Declines whenever two objects share a cell: the ordering along the axis
+        would not be total and the question would have no defined answer.
+        """
+        if not metadata_list or not all_cells_distinct(metadata_list):
+            return None, None, None
+
+        k = random.randint(1, min(len(ORDINALS), len(metadata_list)))
+        side = random.choice(SIDES)
+        ordered = axis_sorted(metadata_list, side)
+
+        steps = enumeration_steps(ordered, f"no {pluralize(GENERIC_NOUN)} found")
+        target = ordered[k - 1]
+        steps.append(f"{ORDINALS[k - 1]} from {side} is {target['shape']}")
+
+        candidate = (f"what shape is {ORDINALS[k - 1]} from the {side}",
+                     target['shape'],
+                     ' . '.join(steps))
+        return candidate if _fits(candidate) else (None, None, None)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -636,8 +872,14 @@ class RationaleGenerator:
             words.update(relation.split())
         words.update(SIDES)
 
-        # digits (grid coordinates 0-7 and counts) and the step separator
+        # ordinals ('what shape is third from the left')
+        words.update(ORDINALS)
+
+        # numbers: grid coordinates 0-7 and single digits, plus every count /
+        # count difference reachable in a scene of up to MAX_OBJECTS objects
+        # (10, 11, 12 are single word-level tokens)
         words.update(str(d) for d in range(10))
+        words.update(str(n) for n in range(MAX_OBJECTS + 1))
         words.add('.')
 
         # answers ('no' is also a template word)

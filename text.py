@@ -15,7 +15,10 @@ except ImportError:  # pragma: no cover - exercised by torch-free tooling
     torch = None
 
 # Token/sequence constants
-MAX_SEQ_LEN = 192
+# 256 leaves room for the dense-scene traces: a 12-object enumeration is ~96
+# tokens and a depth-4 chain enumerates five descriptor sets. The fixed
+# overhead is 74 tokens (see questions.WORD_BUDGET).
+MAX_SEQ_LEN = 256
 NUM_IMG_TOKENS = 64
 
 # Image-first layout:
