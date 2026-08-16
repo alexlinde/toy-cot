@@ -391,7 +391,9 @@ def train(model, text_processor, runtime, args):
 
         if not is_warmup:
             save_model(f'checkpoints/epoch_{epoch + 1}.pth')
-            if overall_em > best_val:
+            # >= so ties advance to the later (more-trained) checkpoint; strict >
+            # froze best.pth at the first epoch that hit EM 1.0
+            if overall_em >= best_val:
                 best_val = overall_em
                 save_model('checkpoints/best.pth')
                 print(f"  new best val answer EM: {best_val:.3f}")
