@@ -133,11 +133,10 @@ uv run python evaluate.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.j
 uv run python test_model.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 ```
 
-`.python-version` pins the interpreter to 3.12; torch 2.13 ships wheels for
-3.10-3.14, so bump the pin whenever you like. Without uv, a plain
-`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` works
-too (`requirements.txt` is kept for pip-only environments, e.g. cloud VM
-images with a preinstalled torch).
+`.python-version` pins the interpreter (currently 3.14). For a pip-only
+environment (e.g. a cloud VM image with a preinstalled torch), the
+dependencies are just `torch numpy tqdm pillow`, or generate a lockfile
+export with `uv export --format requirements-txt`.
 
 Trained artifacts (`toy_vlm_cot.pth`, `tokenizer_vocab.json`,
 `checkpoints/`, `train_log.jsonl`) are gitignored -- train (or run
