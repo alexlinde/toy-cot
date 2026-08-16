@@ -19,7 +19,7 @@ from tqdm import tqdm
 from shapes import ShapeGenerator, MIN_OBJECTS, MAX_OBJECTS
 from questions import RationaleGenerator, DIFFICULTY_MAP
 from text import TextProcessor, SimpleTokenizer, MAX_SEQ_LEN
-from model import ToyVLM, generate_response
+from model import ToyVLM, generate_response, generate_response_self_consistent
 
 
 def best_device() -> torch.device:
@@ -40,11 +40,16 @@ def set_seed(seed: int) -> None:
 class VLMEvaluator:
     """Evaluates VLM on generated test sets, per question type and difficulty."""
 
-    def __init__(self, model: ToyVLM, text_processor: TextProcessor):
+    def __init__(self, model: ToyVLM, text_processor: TextProcessor,
+                 self_consistency_k: int = 1, temperature: float = 0.0,
+                 max_gen_len: int = 80):
         self.model = model
         self.text_processor = text_processor
         self.shape_gen = ShapeGenerator()
         self.rationale_gen = RationaleGenerator()
+        self.self_consistency_k = self_consistency_k
+        self.temperature = temperature
+        self.max_gen_len = max_gen_len
         self.device = next(model.parameters()).device
 
     @staticmethod
@@ -122,9 +127,16 @@ class VLMEvaluator:
             img = self._to_model_image(sample['image'])
 
             try:
-                pred_rationale, pred_answer = generate_response(
-                    self.model, img, question, max_length=35, return_rationale=True
-                )
+                if self.self_consistency_k > 1:
+                    pred_rationale, pred_answer, _ = generate_response_self_consistent(
+                        self.model, img, question, k=self.self_consistency_k,
+                        temperature=self.temperature, max_length=self.max_gen_len
+                    )
+                else:
+                    pred_rationale, pred_answer = generate_response(
+                        self.model, img, question, max_length=self.max_gen_len,
+                        return_rationale=True, temperature=self.temperature
+                    )
                 if not pred_answer.strip():
                     empty_predictions += 1
             except Exception as e:
@@ -330,6 +342,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--out', type=str, default='eval_results.jsonl')
     parser.add_argument('--show-examples', type=int, default=3)
+    parser.add_argument('--self_consistency', type=int, default=1,
+                        help='k chains with majority vote (1 = single chain)')
+    parser.add_argument('--temperature', type=float, default=0.7,
+                        help='rationale sampling temperature; only used when k > 1')
+    parser.add_argument('--max_gen_len', type=int, default=80,
+                        help='max tokens per decode stage (old default 35 truncated long chains)')
     return parser.parse_args()
 
 
@@ -364,7 +382,15 @@ def main() -> None:
     model.eval()
     print(f"Loaded '{args.checkpoint}' onto device: {device}")
 
-    evaluator = VLMEvaluator(model, text_processor)
+    k = args.self_consistency
+    evaluator = VLMEvaluator(
+        model, text_processor,
+        self_consistency_k=k,
+        temperature=args.temperature if k > 1 else 0.0,
+        max_gen_len=args.max_gen_len,
+    )
+    if k > 1:
+        print(f"Self-consistency: {k} chains at temperature {args.temperature}, majority vote")
 
     per_type_metrics = evaluator.evaluate_all_types(
         num_samples_per_type=args.samples, show_examples=args.show_examples

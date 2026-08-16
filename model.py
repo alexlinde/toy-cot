@@ -349,11 +349,14 @@ class ToyVLM(nn.Module):
 
 
 @torch.no_grad()
-def generate_response(model, image, question, max_length=80, return_rationale=True):
-    """Two-stage greedy decoding with special tokens banned from free generation.
+def generate_response(model, image, question, max_length=80, return_rationale=True,
+                      temperature=0.0):
+    """Two-stage decoding with special tokens banned from free generation.
 
     Prompt: [BOS] <IMG_START> <IMG>xN <IMG_END> <|user|> q <|assistant|> <THINK>
     Stage 1 generates the rationale until </THINK>; stage 2 the answer until </FINAL>.
+    The answer stage is always greedy; the rationale stage samples when
+    temperature > 0 (for self-consistency voting).
 
     Args:
         model: ToyVLM instance
@@ -361,6 +364,7 @@ def generate_response(model, image, question, max_length=80, return_rationale=Tr
         question: Question string
         max_length: Maximum steps per stage (rationale/answer)
         return_rationale: If True returns (rationale, answer); else answer
+        temperature: Rationale-stage sampling temperature; 0 = greedy
     """
     model.eval()
     device = next(model.parameters()).device
@@ -387,8 +391,12 @@ def generate_response(model, image, question, max_length=80, return_rationale=Tr
         tok.img_start_id, tok.img_end_id, tok.img_token_id,
     }
 
-    def step_once(ids, allowed_special):
-        """Greedy next token with every special token banned except allowed_special."""
+    def step_once(ids, allowed_special, temp=0.0):
+        """Next token with every special token banned except allowed_special.
+
+        temp=0 -> greedy argmax; temp>0 -> temperature sampling (used by
+        self-consistency to diversify chains).
+        """
         ids_pad = model.text_processor.pad_sequence(ids, MAX_SEQ_LEN)
         ids_t = torch.tensor(ids_pad, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(image.unsqueeze(0), ids_t)
@@ -396,16 +404,19 @@ def generate_response(model, image, question, max_length=80, return_rationale=Tr
         next_logits = logits[0, pos, :].clone()
         banned = [tid for tid in all_special_ids if tid != allowed_special]
         next_logits[banned] = float('-inf')
+        if temp > 0:
+            probs = F.softmax(next_logits / temp, dim=-1)
+            return int(torch.multinomial(probs, 1).item())
         return int(torch.argmax(next_logits).item())
 
     rationale_tokens = []
     answer_tokens = []
 
-    # Stage 1: rationale until </THINK>
+    # Stage 1: rationale until </THINK> (sampled when temperature > 0)
     for _ in range(max_length):
         if len(input_ids) >= MAX_SEQ_LEN - 4:
             break  # leave room for </THINK> <FINAL> answer </FINAL>
-        nxt = step_once(input_ids, allowed_special=tok.think_end_id)
+        nxt = step_once(input_ids, allowed_special=tok.think_end_id, temp=temperature)
         input_ids.append(nxt)
         if nxt == tok.think_end_id:
             break
@@ -430,3 +441,35 @@ def generate_response(model, image, question, max_length=80, return_rationale=Tr
     rationale = tok.decode(rationale_tokens, skip_special_tokens=True)
     answer = tok.decode(answer_tokens, skip_special_tokens=True)
     return (rationale, answer) if return_rationale else answer
+
+
+@torch.no_grad()
+def generate_response_self_consistent(model, image, question, k=5, temperature=0.7,
+                                      max_length=80):
+    """Self-consistency decoding: sample k diverse chains, majority-vote the answer.
+
+    Rationale stages are sampled at `temperature` to diversify the chains; each
+    answer stage stays greedy conditioned on its own chain. Perception errors in
+    the enumerations are partly stochastic, so uncorrelated mistakes wash out in
+    the vote.
+
+    Returns (rationale, answer, chains): the winning answer, a rationale from one
+    of the chains that voted for it, and all k (rationale, answer) chains.
+    """
+    from collections import Counter
+
+    chains = [
+        generate_response(model, image, question, max_length=max_length,
+                          temperature=temperature if k > 1 else 0.0)
+        for _ in range(k)
+    ]
+
+    def norm(s):
+        return ' '.join(s.lower().replace('.', ' ').replace(',', ' ').split())
+
+    votes = Counter(norm(ans) for _, ans in chains)
+    winner = votes.most_common(1)[0][0]
+    for rat, ans in chains:
+        if norm(ans) == winner:
+            return rat, ans, chains
+    return chains[0][0], chains[0][1], chains
