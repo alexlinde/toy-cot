@@ -261,7 +261,7 @@ def train(model, text_processor, runtime, args):
     param_groups = build_param_groups(model, wd=0.01)
     optimizer = runtime["make_optimizer_from_groups"](param_groups, lr=args.lr)
 
-    warmup_epochs = 0 if args.no_perception_warmup else 1
+    warmup_epochs = 0 if (args.no_perception_warmup or args.freeze_encoder) else 1
     steps_per_epoch = math.ceil(args.samples_per_epoch / args.batch_size)
     total_steps = (args.epochs + warmup_epochs) * steps_per_epoch
     scheduler = cosine_warmup_scheduler(optimizer, int(0.03 * total_steps), total_steps)
@@ -297,6 +297,8 @@ def train(model, text_processor, runtime, args):
         else:
             mixture = get_difficulty_mixture(epoch)
             loss_weights = get_loss_weights(epoch, args.epochs)
+            if args.freeze_encoder:
+                loss_weights = {**loss_weights, 'aux': 0.0}  # aux only trains the frozen encoder
             label = f"Epoch {epoch + 1}/{args.epochs}"
 
         dataset = ShapeDataset(args.samples_per_epoch, text_processor,
@@ -415,6 +417,11 @@ def main():
     parser.add_argument("--correction_p", type=float, default=0.0,
                         help="probability of injecting a corrupted fact + oracle "
                              "correction into a training trace (self-correction)")
+    parser.add_argument("--init_encoder_from", type=str, default=None,
+                        help="checkpoint path; load vision_token_encoder.* weights from it")
+    parser.add_argument("--freeze_encoder", action="store_true",
+                        help="freeze the vision encoder (use with --init_encoder_from; "
+                             "disables the aux loss and perception warm-up)")
     parser.add_argument("--no_perception_warmup", action="store_true",
                         help="skip the 1-epoch aux-only perception warm-up")
     args = parser.parse_args()
@@ -433,6 +440,18 @@ def main():
     print(f"Vocabulary size: {text_processor.tokenizer.get_vocab_size()}")
 
     model = ToyVLM(text_processor)
+
+    if args.init_encoder_from:
+        sd = torch.load(args.init_encoder_from, map_location='cpu')
+        enc_sd = {k[len('vision_token_encoder.'):]: v for k, v in sd.items()
+                  if k.startswith('vision_token_encoder.')}
+        model.vision_token_encoder.load_state_dict(enc_sd)
+        print(f"Vision encoder initialized from {args.init_encoder_from} "
+              f"({len(enc_sd)} tensors)")
+    if args.freeze_encoder:
+        assert args.init_encoder_from, "--freeze_encoder without --init_encoder_from freezes random weights"
+        model.vision_token_encoder.requires_grad_(False)
+        print("Vision encoder frozen")
 
     runtime = setup_runtime(prefer_compile=not args.no_compile, try_fp8=args.try_fp8)
 
