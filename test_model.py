@@ -14,6 +14,7 @@ import threading
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 
+import numpy as np
 import torch
 from PIL import Image, ImageTk
 
@@ -93,10 +94,28 @@ def format_model_stats(stats: dict) -> str:
     )
 
 
+def make_seeded_scene(shape_generator: ShapeGenerator, seed: int = None):
+    """Seed the RNGs and generate a scene, so it can be reproduced from the seed alone.
+
+    If `seed` is None, one is drawn first (so it can still be reported back to the
+    caller). Seeding happens immediately before the object-count draw and the image
+    generation call, so the same seed always yields the same image and metadata.
+
+    Returns (seed, image, metadata).
+    """
+    if seed is None:
+        seed = random.randrange(1_000_000)
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
+    image, metadata = shape_generator.generate_multi_shape_image(num_shapes, False)
+    return seed, image, metadata
+
+
 class ToyVLMGUI:
     """Tkinter GUI for the Toy VLM: scene viewer + question box + inference."""
 
-    def __init__(self, checkpoint: str, vocab: str):
+    def __init__(self, checkpoint: str, vocab: str, scene_seed: int = None):
         if not os.path.isfile(vocab):
             sys.exit(f"Vocab file not found: '{vocab}'. Train a model first with train_model.py.")
         if not os.path.isfile(checkpoint):
@@ -118,6 +137,7 @@ class ToyVLMGUI:
         self.shape_generator = ShapeGenerator()
         self.current_image = None  # (64, 64, 3) uint8 RGB
         self.current_metadata = None
+        self.current_seed = None
 
         self.question_history = []
         self.history_index = -1
@@ -127,7 +147,7 @@ class ToyVLMGUI:
         self.root.geometry("900x560")
         self.setup_gui()
 
-        self.generate_new_scene()
+        self.make_scene(scene_seed)
 
     def setup_gui(self):
         """Set up the GUI layout."""
@@ -145,6 +165,14 @@ class ToyVLMGUI:
         self.canvas.pack(pady=10)
 
         ttk.Button(left_frame, text="New Scene", command=self.generate_new_scene).pack(pady=(0, 10))
+
+        seed_frame = ttk.Frame(left_frame)
+        seed_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(seed_frame, text="Seed:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seed_entry = ttk.Entry(seed_frame, width=10)
+        self.seed_entry.pack(side=tk.LEFT, padx=(0, 5))
+        self.seed_entry.bind('<Return>', self.on_load_seed_pressed)
+        ttk.Button(seed_frame, text="Load Seed", command=self.load_seed).pack(side=tk.LEFT)
 
         ttk.Label(left_frame, text="Ground-truth objects:").pack(anchor='w')
         self.metadata_display = scrolledtext.ScrolledText(
@@ -204,13 +232,36 @@ class ToyVLMGUI:
         self.chat_display.see(tk.END)
 
     def generate_new_scene(self):
-        """Generate a new multi-shape RGB scene and update the display."""
-        num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
-        self.current_image, self.current_metadata = self.shape_generator.generate_multi_shape_image(
-            num_shapes, False
+        """Generate a new multi-shape RGB scene with a fresh random seed."""
+        self.make_scene()
+
+    def make_scene(self, seed=None):
+        """Generate (or reproduce) a scene from a seed and update the display.
+
+        If `seed` is None, a random one is drawn. Same seed + same code always
+        gives back the same image and metadata, so a seed alone is enough to
+        share and reproduce a scene.
+        """
+        self.current_seed, self.current_image, self.current_metadata = make_seeded_scene(
+            self.shape_generator, seed
         )
         self.update_canvas_display()
         self.update_metadata_display()
+        self.root.title(f"Toy Vision-Language Model - seed: {self.current_seed}")
+
+    def load_seed(self):
+        """Parse the seed entry and regenerate that exact scene."""
+        text = self.seed_entry.get().strip()
+        try:
+            seed = int(text)
+        except ValueError:
+            self.add_to_chat(f"'{text}' isn't a valid seed - please enter an integer.", "System")
+            return
+        self.make_scene(seed)
+
+    def on_load_seed_pressed(self, event):
+        """Handle Enter key press in the seed entry."""
+        self.load_seed()
 
     def update_canvas_display(self):
         """Update the canvas with the current RGB scene, scaled up."""
@@ -222,9 +273,10 @@ class ToyVLMGUI:
         self.canvas.create_image(0, 0, image=self.photo, anchor='nw')
 
     def update_metadata_display(self):
-        """Show ground-truth shape/color/size/cell info for each object."""
+        """Show the seed, then ground-truth shape/color/size/cell info for each object."""
         self.metadata_display.config(state='normal')
         self.metadata_display.delete('1.0', tk.END)
+        self.metadata_display.insert(tk.END, f"seed: {self.current_seed}\n\n")
         for i, m in enumerate(self.current_metadata, start=1):
             row, col = grid_row(m['cy']), grid_col(m['cx'])
             self.metadata_display.insert(
@@ -292,12 +344,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive GUI for the Toy VLM.")
     parser.add_argument('--checkpoint', type=str, default='toy_vlm_cot.pth')
     parser.add_argument('--vocab', type=str, default='tokenizer_vocab.json')
+    parser.add_argument('--scene_seed', type=int, default=None,
+                         help="Seed for the first scene shown (default: random).")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    gui = ToyVLMGUI(checkpoint=args.checkpoint, vocab=args.vocab)
+    gui = ToyVLMGUI(checkpoint=args.checkpoint, vocab=args.vocab, scene_seed=args.scene_seed)
     gui.run()
 
 
