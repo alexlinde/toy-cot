@@ -105,7 +105,7 @@ Default hyperparameters (`--epochs 20 --samples_per_epoch 100000
 GCS or lambda.ai instance. On Apple Silicon (MPS), reduce scale, e.g.:
 
 ```bash
-.venv/bin/python train_model.py --samples_per_epoch 10000 --batch_size 64 --no_compile
+uv run python train_model.py --samples_per_epoch 10000 --batch_size 64 --no_compile
 ```
 
 Device selection, autocast/AMP, and dataloader settings are all handled
@@ -114,25 +114,30 @@ automatically by `runtime.py` (CUDA -> MPS -> CPU).
 ## Usage
 
 ```bash
-# Set up the environment
-python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+# Set up the environment (https://docs.astral.sh/uv/)
+uv sync
 
 # Validate the data layer (no model, no torch-heavy work required)
-.venv/bin/python validate_traces.py --samples 1000
+uv run python validate_traces.py --samples 1000
 
 # Fast end-to-end smoke test: can the model overfit 64 fixed samples?
-.venv/bin/python test_force.py --steps 500 --samples 64
+uv run python test_force.py --steps 500 --samples 64
 
 # Train
-.venv/bin/python train_model.py
+uv run python train_model.py
 
 # Evaluate a trained checkpoint (per-question-type exact match + majority baselines)
-.venv/bin/python evaluate.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
+uv run python evaluate.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 
 # Interactive GUI: generate scenes, ask questions, see rationale + answer
-.venv/bin/python test_model.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
+uv run python test_model.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 ```
+
+`.python-version` pins the interpreter to 3.12; torch 2.13 ships wheels for
+3.10-3.14, so bump the pin whenever you like. Without uv, a plain
+`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` works
+too (`requirements.txt` is kept for pip-only environments, e.g. cloud VM
+images with a preinstalled torch).
 
 Trained artifacts (`toy_vlm_cot.pth`, `tokenizer_vocab.json`,
 `checkpoints/`, `train_log.jsonl`) are gitignored -- train (or run

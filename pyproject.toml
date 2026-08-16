@@ -1,0 +1,11 @@
+[project]
+name = "toy-cot"
+version = "0.1.0"
+description = "Toy VLM with chain-of-thought reasoning over 2D shape scenes"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.9",
+    "numpy",
+    "tqdm",
+    "pillow",
+]
