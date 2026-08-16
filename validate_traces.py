@@ -28,8 +28,16 @@ tokenizing with allow_unk=False so any out-of-vocabulary word is a hard failure.
 A final stress pass hammers the generators at maximum scene density to prove no
 draw can overflow the model's context.
 
+With ``--correction_p P`` each verified sample is additionally run through
+questions.inject_correction with probability P, and the resulting
+error-injected self-correction trace is verified too: the injected fact must be
+unambiguously false, the correction must restore the original (real) fact, the
+answer must be untouched, and the segment masks must leave exactly the
+corrupted tokens unsupervised.
+
 Usage:
     python validate_traces.py [--samples 1000] [--seed 0] [--stress 65536]
+                              [--correction_p 0.0] [--roundtrip 500]
 """
 
 import argparse
@@ -49,7 +57,18 @@ from shapes import (
     grid_col,
     grid_row,
 )
-from questions import DIFFICULTY_MAP, RationaleGenerator
+from questions import (
+    CORRECTION_MARKER,
+    CORRECTION_RESERVE,
+    DIFFICULTY_MAP,
+    ENUM_FACT,
+    QUESTION_RESERVE,
+    STEP_SEP,
+    WORD_BUDGET,
+    RationaleGenerator,
+    inject_correction,
+    split_steps,
+)
 from text import MAX_SEQ_LEN, PREFIX_LEN, SimpleTokenizer, TextProcessor
 
 # ---------------------------------------------------------------------------
@@ -690,6 +709,210 @@ YES_NO_TYPES = set(CHECKERS) - OPEN_ANSWER_TYPES
 
 
 # ---------------------------------------------------------------------------
+# Error-injected correction traces (--correction_p)
+# ---------------------------------------------------------------------------
+
+def enum_matches(step: str, meta: Sequence[Dict[str, Any]],
+                 ignore_size: bool = False) -> List[Dict[str, Any]]:
+    """Objects the enumeration `step` could be describing (may be empty)."""
+    m = ENUM_STEP.fullmatch(step)
+    if not m:
+        raise SampleError(f"step {step!r} is not an enumeration fact")
+    size, color, shape, row, col = m.groups()
+    return [o for o in meta
+            if o['color'] == color and o['shape'] == shape
+            and cell(o) == (int(row), int(col))
+            and (ignore_size or size is None or o['size_category'] == size)]
+
+
+def fact_fields(step: str) -> Tuple[Optional[str], str, str, int, int]:
+    m = ENUM_STEP.fullmatch(step)
+    if not m:
+        raise SampleError(f"step {step!r} is not an enumeration fact")
+    size, color, shape, row, col = m.groups()
+    return size, color, shape, int(row), int(col)
+
+
+def segment_layout(segments: Sequence[Tuple[str, bool]]) -> Tuple[List[str], int, int]:
+    """Return (steps of the corrected trace, step index and segment index of the
+    corrupted fact).
+
+    Enforces the injector's contract: exactly one unsupervised segment, holding
+    exactly one whole step, and the concatenation of the segments splits cleanly
+    on the ' . ' separator (no doubled or missing separators).
+    """
+    if not segments:
+        raise SampleError("inject_correction returned an empty segment list")
+    wrong = [j for j, (_text, supervised) in enumerate(segments) if not supervised]
+    if len(wrong) != 1:
+        raise SampleError(f"expected exactly one unsupervised segment, got {len(wrong)}")
+    j = wrong[0]
+    corrupted = segments[j][0]
+    if STEP_SEP in corrupted or corrupted != corrupted.strip():
+        raise SampleError(f"unsupervised segment {corrupted!r} is not a single bare step")
+
+    full = ''.join(text for text, _sup in segments)
+    if full != full.strip():
+        raise SampleError(f"reassembled trace has a dangling separator: {full!r}")
+    steps = full.split(STEP_SEP)
+    if any(not step or step != step.strip() for step in steps):
+        raise SampleError(f"reassembled trace has doubled separators: {full!r}")
+    if STEP_SEP.join(steps) != full:
+        raise SampleError(f"reassembled trace does not round-trip its steps: {full!r}")
+
+    index = ''.join(text for text, _sup in segments[:j]).count(STEP_SEP)
+    if steps[index] != corrupted:
+        raise SampleError(f"unsupervised segment {corrupted!r} is not step {index} "
+                          f"({steps[index]!r}) of the reassembled trace")
+    return steps, index, j
+
+
+def check_correction(qtype: str, question: str, answer: str, rationale: str,
+                     segments: Sequence[Tuple[str, bool]],
+                     meta: Sequence[Dict[str, Any]], processor: TextProcessor
+                     ) -> Tuple[List[int], List[int], int]:
+    """Verify one error-injected correction trace.
+
+    Returns (target_ids, rat_mask, think_start) so the caller can print a spot
+    example. Raises SampleError on any violation.
+    """
+    steps, index, seg_index = segment_layout(segments)
+
+    # ---- structure: {corrupted} . wait . {original} ----------------------
+    if index + 2 >= len(steps):
+        raise SampleError("correction insertion runs past the end of the trace")
+    if steps[index + 1] != CORRECTION_MARKER:
+        raise SampleError(f"step after the corrupted fact is {steps[index + 1]!r}, "
+                          f"expected {CORRECTION_MARKER!r}")
+    corrupted, correction = steps[index], steps[index + 2]
+
+    # ---- (b) the correction restores the original, real fact -------------
+    original_steps = steps[:index] + steps[index + 2:]
+    original = STEP_SEP.join(original_steps)
+    if original != rationale:
+        raise SampleError(f"stripping the insertion yields {original!r}, "
+                          f"not the gold rationale {rationale!r}")
+    if not enum_matches(correction, meta):
+        raise SampleError(f"correction step {correction!r} describes no real object")
+
+    # ---- (a) the injected fact is genuinely wrong ------------------------
+    if enum_matches(corrupted, meta, ignore_size=True):
+        raise SampleError(f"corrupted step {corrupted!r} still matches an object "
+                          f"in the scene: it is not an error")
+    wrong_fields = fact_fields(corrupted)
+    true_fields = fact_fields(correction)
+    differing = [name for name, w, t in zip(('size', 'color', 'shape', 'row', 'col'),
+                                            wrong_fields, true_fields) if w != t]
+    if 'size' in differing:
+        raise SampleError(f"corruption changed the size prefix: {corrupted!r}")
+    if len(differing) != 1:
+        raise SampleError(f"corruption changed {differing} of {correction!r}, "
+                          f"expected exactly one attribute")
+    if differing[0] in ('row', 'col'):
+        w, t = (wrong_fields[3], true_fields[3]) if differing[0] == 'row' \
+            else (wrong_fields[4], true_fields[4])
+        if abs(w - t) != 1 or not 1 <= w <= 6:
+            raise SampleError(f"{differing[0]} corrupted from {t} to {w}: expected "
+                              f"+/-1 inside the occupied 1..6 band")
+
+    # ---- (d) the answer is untouched and still correct -------------------
+    check_step_facts(original, meta)
+    CHECKERS[qtype](question, answer, original, meta)
+
+    # ---- (c) masks: corrupted tokens unsupervised, correction supervised --
+    tok = processor.tokenizer
+    seg_tokens = [tok.tokenize(text) for text, _sup in segments]
+    flags = [1 if supervised else 0
+             for (_text, supervised), toks in zip(segments, seg_tokens)
+             for _ in toks]
+    r_tokens = [t for toks in seg_tokens for t in toks]
+    full = ''.join(text for text, _sup in segments)
+    if tok.tokenize(full) != r_tokens:
+        raise SampleError("segment-wise tokenization differs from the joined trace: "
+                          "separator discipline is broken")
+
+    try:
+        input_ids, target_ids, rat_mask, ans_mask = \
+            processor.prepare_input_sequence(question, answer, segments)
+    except AssertionError as exc:
+        raise SampleError(f"corrected trace does not fit MAX_SEQ_LEN: {exc}")
+    except ValueError as exc:
+        raise SampleError(f"corrected trace has an out-of-vocabulary word: {exc}")
+
+    th_s = input_ids.index(tok.think_start_id)
+    if input_ids[th_s + 1: th_s + 1 + len(r_tokens)] != r_tokens:
+        raise SampleError("THINK span does not carry the segment tokens")
+    # rat_mask[k] supervises the prediction of input_ids[k+1], so rationale
+    # token `idx` is supervised iff rat_mask[th_s + idx] == 1.
+    for idx, flag in enumerate(flags):
+        if rat_mask[th_s + idx] != flag:
+            raise SampleError(f"rat_mask[{idx}] = {rat_mask[th_s + idx]}, expected "
+                              f"{flag} for token {tok.idx_to_word[r_tokens[idx]]!r}")
+    if rat_mask[th_s + len(r_tokens)] != 1:
+        raise SampleError("</THINK> must stay supervised")
+
+    lo = sum(len(toks) for toks in seg_tokens[:seg_index])
+    hi = lo + len(tok.tokenize(corrupted))
+    if any(rat_mask[th_s + idx] for idx in range(lo, hi)):
+        raise SampleError(f"corrupted step {corrupted!r} has supervised positions")
+    # ' . ' then 'wait' then ' . ' then the corrected fact, all supervised.
+    marker_span = range(hi, hi + 3 + len(tok.tokenize(correction)))
+    if not all(rat_mask[th_s + idx] for idx in marker_span):
+        raise SampleError("the wait marker / corrected fact must stay supervised")
+    if tok.idx_to_word[r_tokens[hi + 1]] != CORRECTION_MARKER:
+        raise SampleError(f"token after the corrupted step is "
+                          f"{tok.idx_to_word[r_tokens[hi + 1]]!r}, not {CORRECTION_MARKER!r}")
+    if sum(ans_mask) != len(tok.tokenize(answer)) + 1:
+        raise SampleError("answer supervision changed under injection")
+
+    return target_ids, rat_mask, th_s
+
+
+def masked_trace(processor: TextProcessor, target_ids: Sequence[int],
+                 rat_mask: Sequence[int], th_s: int) -> str:
+    """'word[mask] word[mask] ...' over the THINK span, for a printed example."""
+    tok = processor.tokenizer
+    words = []
+    for k in range(th_s, len(target_ids)):
+        word = tok.idx_to_word.get(target_ids[k], '?')
+        words.append(f"{word}[{rat_mask[k]}]")
+        if target_ids[k] == tok.think_end_id:
+            break
+    return ' '.join(words)
+
+
+def roundtrip_pass(shape_gen, rg, processor, draws: int) -> Tuple[int, List[str]]:
+    """A plain string and [(string, True)] must prepare to identical outputs."""
+    generators = list(rg.generators.items())
+    problems: List[str] = []
+    checked = 0
+    scenes = max(1, (draws + len(generators) - 1) // len(generators))
+
+    for _ in range(scenes):
+        num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
+        _img, meta = shape_gen.generate_multi_shape_image(num_shapes, False)
+        for qtype, generator in generators:
+            if checked >= draws:
+                break
+            question, answer, rationale = generator(meta)
+            if question is None:
+                continue
+            try:
+                plain = processor.prepare_input_sequence(question, answer, rationale)
+                segmented = processor.prepare_input_sequence(
+                    question, answer, [(rationale, True)])
+            except (AssertionError, ValueError):
+                continue
+            checked += 1
+            if plain != segmented:
+                problems.append(f"[roundtrip/{qtype}] segmented output differs from "
+                                f"the plain-string output: q={question!r}")
+    print(f"round-trip pass: {checked} samples, {len(problems)} mismatches between "
+          f"rationale='...' and rationale=[('...', True)]")
+    return checked, problems
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -707,18 +930,23 @@ def numeric_spread(answers: Counter) -> str:
                      for k in sorted(answers, key=int))
 
 
-def stress_pass(shape_gen, rg, processor, draws: int, max_objects: int
-                ) -> Tuple[int, int, int, List[str]]:
+def stress_pass(shape_gen, rg, processor, draws: int, max_objects: int,
+                correction_p: float = 0.0) -> Tuple[int, int, int, List[str]]:
     """Hammer every generator at maximum scene density.
 
     Returns (draws made, overflows, declines, problems). A draw that does not
     fit MAX_SEQ_LEN, or that contains an out-of-vocabulary word, is a hard
     failure: training tokenizes with allow_unk=False and asserts on overflow.
+    With `correction_p` > 0 each fitting draw is also error-injected at that
+    probability and the corrected trace must fit as well -- this is the proof
+    that CORRECTION_RESERVE keeps the insertion inside the context.
     """
     generators = list(rg.generators.items())
     scenes = max(1, draws // max(1, len(generators)))
     made = overflow = declined = 0
+    injected = 0
     longest = 0
+    longest_corrected = 0
     problems: List[str] = []
 
     for _ in range(scenes):
@@ -743,9 +971,39 @@ def stress_pass(shape_gen, rg, processor, draws: int, max_objects: int
                 continue
             longest = max(longest, len(input_ids))
 
+            if correction_p <= 0 or random.random() >= correction_p:
+                continue
+            # Alternate the two call shapes: with the exact word count (what the
+            # validator can compute) and without it (what train_model's dataset
+            # passes, which falls back to QUESTION_RESERVE). Neither may overflow.
+            reserved = (len(question.split()) + len(answer.split())
+                        if made % 2 == 0 else None)
+            segments = inject_correction(rationale, meta, reserved_words=reserved)
+            if segments is None:
+                continue
+            injected += 1
+            try:
+                corrected_ids, _t, _r, _a = processor.prepare_input_sequence(
+                    question, answer, segments)
+            except AssertionError:
+                overflow += 1
+                if overflow <= 3:
+                    problems.append(f"[stress/{qtype}] corrected trace overflow: "
+                                    f"q={question!r} segments={segments!r}")
+                continue
+            except ValueError as exc:
+                problems.append(f"[stress/{qtype}] corrected trace out-of-vocabulary "
+                                f"word: {exc}")
+                continue
+            longest_corrected = max(longest_corrected, len(corrected_ids))
+
     print(f"stress pass: {made} draws over {scenes} scenes at N={max_objects}, "
           f"{overflow} overflows, {declined} declines, longest {longest} tokens "
           f"/ MAX_SEQ_LEN={MAX_SEQ_LEN}")
+    if correction_p > 0:
+        print(f"  correction_p={correction_p}: {injected} injections applied, "
+              f"longest corrected {longest_corrected} tokens "
+              f"/ MAX_SEQ_LEN={MAX_SEQ_LEN}")
     return made, overflow, declined, problems
 
 
@@ -759,7 +1017,16 @@ def main() -> int:
     parser.add_argument('--stress', type=int, default=65536,
                         help='question draws at maximum scene density in the '
                              'overflow stress pass (0 disables it)')
+    parser.add_argument('--correction_p', type=float, default=0.0,
+                        help='probability of error-injecting each verified sample '
+                             'and validating the resulting correction trace '
+                             '(default: 0, i.e. gold traces only)')
+    parser.add_argument('--roundtrip', type=int, default=500,
+                        help='samples checked for string/segment equivalence of '
+                             'prepare_input_sequence (0 disables it)')
     args = parser.parse_args()
+    if not 0.0 <= args.correction_p <= 1.0:
+        parser.error('--correction_p must lie in [0, 1]')
 
     random.seed(args.seed)
 
@@ -791,6 +1058,8 @@ def main() -> int:
     shared_cell_scenes = 0
     global_max_len = 0
     longest_sample = None
+    correction_example = None
+    max_qa_words = 0
 
     for qtype, generator in rg.generators.items():
         answers: Counter = Counter()
@@ -798,6 +1067,12 @@ def main() -> int:
         skipped = 0
         checked = 0
         type_failures = 0
+        corr_tried = 0
+        corr_applied = 0
+        corr_declined_budget = 0
+        corr_declined_facts = 0
+        corr_declined_true = 0
+        corr_default_extra = 0
 
         for _ in range(args.samples):
             num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
@@ -828,6 +1103,8 @@ def main() -> int:
                 continue
 
             answers[answer] += 1
+            max_qa_words = max(max_qa_words,
+                               len(question.split()) + len(answer.split()))
             used_words.update(rationale.split())
             used_words.update(question.split())
             used_words.update(answer.split())
@@ -858,12 +1135,57 @@ def main() -> int:
                 global_max_len = len(input_ids)
                 longest_sample = (qtype, question, answer, rationale, len(input_ids))
 
+            # 3. error-injected correction trace (opt-in)
+            if args.correction_p <= 0 or random.random() >= args.correction_p:
+                continue
+            corr_tried += 1
+            reserved = len(question.split()) + len(answer.split())
+            # How often the budget guard costs an injection when the caller does
+            # not pass reserved_words (train_model's call shape).
+            if (len(rationale.split()) + reserved <= WORD_BUDGET - CORRECTION_RESERVE
+                    < len(rationale.split()) + QUESTION_RESERVE):
+                corr_default_extra += 1
+            segments = inject_correction(rationale, meta, reserved_words=reserved)
+            if segments is None:
+                # Three reasons to decline, reported separately and in the order
+                # the injector applies them: the trace has no enumeration fact to
+                # corrupt, it is within CORRECTION_RESERVE words of the budget, or
+                # every corruption drawn happened to describe a real object.
+                if not any(ENUM_FACT.fullmatch(s) for s in split_steps(rationale)):
+                    corr_declined_facts += 1
+                elif len(rationale.split()) + reserved > WORD_BUDGET - CORRECTION_RESERVE:
+                    corr_declined_budget += 1
+                else:
+                    corr_declined_true += 1
+                continue
+            try:
+                target_ids, rat_mask, th_s = check_correction(
+                    qtype, question, answer, rationale, segments, meta, processor)
+                corr_applied += 1
+            except SampleError as exc:
+                type_failures += 1
+                if type_failures <= args.max_failures:
+                    failures.append(f"[{qtype}/correction] {exc}\n"
+                                    f"    q={question!r}\n    a={answer!r}\n"
+                                    f"    r={rationale!r}\n    segments={segments!r}")
+                continue
+            used_words.update(''.join(text for text, _sup in segments).split())
+            if correction_example is None:
+                correction_example = (qtype, question, answer, segments,
+                                      masked_trace(processor, target_ids, rat_mask, th_s))
+
         stats[qtype] = {
             'checked': checked,
             'skipped': skipped,
             'failures': type_failures,
             'answers': answers,
             'max_len': max_len,
+            'corr_tried': corr_tried,
+            'corr_applied': corr_applied,
+            'corr_declined_budget': corr_declined_budget,
+            'corr_declined_facts': corr_declined_facts,
+            'corr_declined_true': corr_declined_true,
+            'corr_default_extra': corr_default_extra,
         }
 
     # ---------------------------------------------------------------- report
@@ -896,6 +1218,9 @@ def main() -> int:
     if longest_sample:
         qtype, q, a, r, n = longest_sample
         print(f"  longest ({n} tokens, {qtype}): q={q!r}")
+    print(f"max question+answer words: {max_qa_words} / QUESTION_RESERVE="
+          f"{QUESTION_RESERVE} (the worst case inject_correction charges when the "
+          f"caller does not pass reserved_words)")
 
     counting_answers = stats['counting']['answers']
     print(f"counting answer distribution:  {numeric_spread(counting_answers)}")
@@ -918,7 +1243,40 @@ def main() -> int:
 
     unused = sorted(vocabulary - used_words)
     if unused:
-        print(f"vocabulary words never observed ({len(unused)}): {unused}")
+        note = (f"  ({CORRECTION_MARKER!r} is only emitted by inject_correction; "
+                f"run with --correction_p > 0)"
+                if unused == [CORRECTION_MARKER] else "")
+        print(f"vocabulary words never observed ({len(unused)}): {unused}{note}")
+
+    total_tried = total_applied = 0
+    if args.correction_p > 0:
+        print()
+        print(f"error-injected correction traces (--correction_p {args.correction_p}, "
+              f"reserve {CORRECTION_RESERVE} words):")
+        corr_header = (f"{'question type':<24}{'tried':>8}{'injected':>10}{'rate':>8}"
+                       f"{'no-fact':>9}{'near-budget':>13}{'no-error':>10}")
+        print(corr_header)
+        print("-" * len(corr_header))
+        for qtype, s in stats.items():
+            tried, applied = s['corr_tried'], s['corr_applied']
+            total_tried += tried
+            total_applied += applied
+            rate = f"{100.0 * applied / tried:.1f}%" if tried else "n/a"
+            print(f"{qtype:<24}{tried:>8}{applied:>10}{rate:>8}"
+                  f"{s['corr_declined_facts']:>9}{s['corr_declined_budget']:>13}"
+                  f"{s['corr_declined_true']:>10}")
+        print("-" * len(corr_header))
+        overall = f"{100.0 * total_applied / total_tried:.1f}%" if total_tried else "n/a"
+        print(f"{'all types':<24}{total_tried:>8}{total_applied:>10}{overall:>8}")
+        default_extra = sum(s['corr_default_extra'] for s in stats.values())
+        print(f"a caller that does not pass reserved_words (train_model's shape) "
+              f"declines {default_extra} more of these ({100.0 * default_extra / max(1, total_tried):.1f}%)")
+        if correction_example:
+            qtype, q, a, segments, masked = correction_example
+            print(f"\nexample corrected trace ({qtype}): q={q!r} a={a!r}")
+            for text, supervised in segments:
+                print(f"  {'sup ' if supervised else 'UNSUP'} {text!r}")
+            print(f"  targets[mask]: {masked}")
 
     problems = []
     if failures:
@@ -937,12 +1295,25 @@ def main() -> int:
                                 f"(yes={100 * yes_share:.1f}%)")
     if counting_answers.get('0', 0) == 0:
         problems.append("counting: a count of 0 never occurred")
+    if args.correction_p > 0 and total_applied == 0:
+        problems.append("correction injection never applied to a single sample")
     if global_max_len > MAX_SEQ_LEN:
         problems.append(f"max sequence length {global_max_len} exceeds {MAX_SEQ_LEN}")
+    if max_qa_words > QUESTION_RESERVE:
+        problems.append(f"a question+answer takes {max_qa_words} words, more than "
+                        f"QUESTION_RESERVE={QUESTION_RESERVE}: inject_correction's "
+                        f"default budget guard is no longer safe")
+
+    if args.roundtrip > 0:
+        _rt_checked, rt_problems = roundtrip_pass(shape_gen, rg, processor,
+                                                  args.roundtrip)
+        failures.extend(rt_problems)
+        if rt_problems:
+            problems.append(f"{len(rt_problems)} string/segment round-trip mismatches")
 
     if args.stress > 0:
         made, overflow, declined, stress_problems = stress_pass(
-            shape_gen, rg, processor, args.stress, MAX_OBJECTS)
+            shape_gen, rg, processor, args.stress, MAX_OBJECTS, args.correction_p)
         failures.extend(stress_problems)
         if overflow:
             problems.append(f"{overflow}/{made} stress draws overflow MAX_SEQ_LEN")

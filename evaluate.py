@@ -197,6 +197,10 @@ class VLMEvaluator:
         majority_count = Counter(self.normalize_answer(a) for a in gt_answers).most_common(1)
         majority_baseline = (majority_count[0][1] / total) if total > 0 and majority_count else 0.0
 
+        # Self-correction telemetry: how often does the model emit 'wait'?
+        wait_rate = sum(1 for r in results
+                        if ' wait ' in f" {r['predicted_rationale']} ") / total if total else 0.0
+
         # Accuracy vs scene object count (the crossover-curve data): 2-object bins
         by_n: Dict[str, Dict[str, Any]] = {}
         for r in results:
@@ -216,6 +220,7 @@ class VLMEvaluator:
             'rationale_exact': rationale_exact,
             'empty': empty_predictions,
             'errors': generation_errors,
+            'wait_rate': wait_rate,
             'by_n': {k: {'n': v['n'], 'accuracy': v['accuracy']}
                      for k, v in sorted(by_n.items(), key=lambda kv: int(kv[0].split('-')[0]))},
         }
@@ -377,6 +382,7 @@ def write_results(
         for m in per_type_metrics.values():
             row = {k: m[k] for k in fields}
             row['by_n'] = m.get('by_n', {})
+            row['wait_rate'] = m.get('wait_rate', 0.0)
             f.write(json.dumps(row) + '\n')
         f.write(json.dumps({k: overall_metrics[k] for k in fields}) + '\n')
 

@@ -2,12 +2,21 @@
 Text processing module for the Toy VLM.
 Updated to support prefixing image tokens in the sequence and
 multi-turn-friendly special tokens for user/assistant and reasoning spans.
+
+Rationales may be passed to TextProcessor.prepare_input_sequence either as a
+plain string (fully supervised, the historical behavior) or as a list of
+``(text, supervised)`` segments. Unsupervised segments still contribute their
+tokens to ``input_ids`` -- the model reads them as context -- but their target
+positions are zeroed in ``rat_mask``, which is what makes error-injected
+self-correction traces trainable: the model learns to recover from a wrong
+enumeration fact without ever being taught to emit one
+(see questions.inject_correction).
 """
 
 import re
 import json
 import os
-from typing import List, Set
+from typing import List, Sequence, Set, Tuple, Union
 
 try:  # torch is only needed to decode tensors; the data layer must run without it
     import torch
@@ -29,6 +38,31 @@ NUM_IMG_TOKENS = 64
 #   position 67 onwards   : <|user|> question ...
 IMG_POS_START = 2
 PREFIX_LEN = 2 + NUM_IMG_TOKENS + 1  # 67: BOS + IMG_START + 64 <IMG> + IMG_END
+
+# A rationale is either one fully supervised string or a list of segments.
+RationaleSegment = Tuple[str, bool]
+RationaleSpec = Union[str, Sequence[RationaleSegment], None]
+
+
+def as_segments(rationale: RationaleSpec) -> List[RationaleSegment]:
+    """Normalize a rationale into a list of ``(text, supervised)`` segments.
+
+    A plain string is one fully supervised segment, so every existing call site
+    keeps its exact behavior. Segment texts are concatenated *verbatim* (no
+    separator is inserted), so the caller owns the ' . ' step separators and the
+    concatenation is the rationale the model actually reads.
+    """
+    if rationale is None:
+        return []
+    if isinstance(rationale, str):
+        return [(rationale, True)]
+    segments: List[RationaleSegment] = []
+    for segment in rationale:
+        text, supervised = segment
+        if not isinstance(text, str):
+            raise TypeError(f"[text] rationale segment text must be str, got {text!r}")
+        segments.append((text, bool(supervised)))
+    return segments
 
 class SimpleTokenizer:
     """Simple word-based tokenizer for the toy VLM (word-level)."""
@@ -206,7 +240,7 @@ class TextProcessor:
         self,
         question: str,
         answer: str = None,
-        rationale: str = None
+        rationale: RationaleSpec = None
     ) -> tuple:
         """
         Compose sequence per image-first format:
@@ -218,12 +252,27 @@ class TextProcessor:
 
         The image block occupies a fixed span (positions 1..PREFIX_LEN-1), so
         the model can build its attention mask from PREFIX_LEN/IMG_POS_START.
+
+        `rationale` is either a plain string (every rationale token supervised)
+        or a list of ``(text, supervised)`` segments. Tokens of an unsupervised
+        segment are part of input_ids like any other -- the model conditions on
+        them -- but the target positions that *predict* them carry rat_mask=0.
         """
         tok = self.tokenizer
 
         q_tokens = tok.tokenize(question)
         a_tokens = tok.tokenize(answer) if answer is not None else []
-        r_tokens = tok.tokenize(rationale) if rationale is not None else []
+
+        # Rationale tokens, plus a per-token supervision flag from the segment
+        # each token came from. Tokenizing segment by segment is equivalent to
+        # tokenizing their concatenation as long as segment boundaries fall on
+        # whitespace, which the ' . ' step separator guarantees.
+        r_tokens: List[int] = []
+        r_supervised: List[int] = []
+        for text, supervised in as_segments(rationale):
+            segment_tokens = tok.tokenize(text)
+            r_tokens.extend(segment_tokens)
+            r_supervised.extend([1 if supervised else 0] * len(segment_tokens))
 
         img_block = [tok.img_start_id] + [tok.img_token_id] * NUM_IMG_TOKENS + [tok.img_end_id]
 
@@ -267,11 +316,15 @@ class TextProcessor:
         fn_e = find_pos(tok.final_end_id)
 
         # Map to target positions: target[k] == input_ids[k+1]
-        # Supervise content tokens AND the closing tag for each span.
+        # Supervise content tokens AND the closing tag for each span. Inside the
+        # THINK span a content token is supervised only if its segment was:
+        # offset counts rationale tokens, and offset == len(r_tokens) is the
+        # </THINK> tag itself, which is always supervised.
         for k in range(len(target_ids)):
             pred_idx = k + 1  # index into input_ids of the token being predicted
             if th_s != -1 and th_e != -1 and th_s < pred_idx <= th_e:
-                rat_mask[k] = 1
+                offset = pred_idx - th_s - 1
+                rat_mask[k] = 1 if offset >= len(r_tokens) else r_supervised[offset]
             if fn_s != -1 and fn_e != -1 and fn_s < pred_idx <= fn_e:
                 ans_mask[k] = 1
 
@@ -311,8 +364,23 @@ class TextProcessor:
         assert asst_p > usr_p, "[text] <|assistant|> must come after <|user|>"
         # THINK and FINAL sections exist even if empty strings were passed (they may be contiguous)
         assert th_s > asst_p and th_e > th_s, "[text] Invalid THINK span"
+        assert th_e - th_s - 1 == len(r_tokens), (
+            f"[text] THINK span holds {th_e - th_s - 1} tokens, "
+            f"segments produced {len(r_tokens)}"
+        )
         assert fn_s > th_e and fn_e > fn_s, "[text] Invalid FINAL span"
         assert eos_p == len(input_ids)-1, "[text] <EOS> must be final token"
+
+        # Segment-level supervision must land exactly on the rationale span:
+        # one supervised target per supervised rationale token, plus </THINK>.
+        assert sum(rat_mask) == sum(r_supervised) + 1, (
+            f"[text] rat_mask supervises {sum(rat_mask)} positions, expected "
+            f"{sum(r_supervised) + 1} (supervised rationale tokens + </THINK>)"
+        )
+        assert sum(ans_mask) == len(a_tokens) + 1, (
+            f"[text] ans_mask supervises {sum(ans_mask)} positions, expected "
+            f"{len(a_tokens) + 1} (answer tokens + </FINAL>)"
+        )
 
         # Mask policy sanity: special markers must be unsupervised
         special_set = {

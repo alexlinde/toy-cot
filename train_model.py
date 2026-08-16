@@ -23,7 +23,7 @@ import json
 import os
 import time
 from shapes import ShapeGenerator, ObjType, ObjSize, COLORS, MIN_OBJECTS, MAX_OBJECTS
-from questions import RationaleGenerator
+from questions import RationaleGenerator, inject_correction
 from text import TextProcessor, MAX_SEQ_LEN
 from model import ToyVLM
 from runtime import setup_runtime
@@ -48,7 +48,8 @@ class ShapeDataset(Dataset):
     """
 
     def __init__(self, num_samples: int, text_processor: TextProcessor,
-                 mixture: Dict[str, float], use_cot: bool = True):
+                 mixture: Dict[str, float], use_cot: bool = True,
+                 correction_p: float = 0.0):
         self.num_samples = num_samples
         self.shape_generator = ShapeGenerator()
         self.rationale_generator = RationaleGenerator()
@@ -56,6 +57,7 @@ class ShapeDataset(Dataset):
         self.difficulties = list(mixture.keys())
         self.weights = [mixture[d] for d in self.difficulties]
         self.use_cot = use_cot
+        self.correction_p = correction_p
 
     def __len__(self):
         return self.num_samples
@@ -72,8 +74,19 @@ class ShapeDataset(Dataset):
         if not self.use_cot:
             rationale = ""  # ablation: empty <THINK> span, no rationale supervision
 
+        # Self-correction training: sometimes inject a corrupted fact + oracle
+        # correction; the corrupted tokens are context-only (unsupervised).
+        rationale_for_prep = rationale
+        if self.use_cot and self.correction_p > 0 and random.random() < self.correction_p:
+            segments = inject_correction(
+                rationale, metadata_list,
+                reserved_words=len(question.split()) + len(answer.split()),
+            )
+            if segments is not None:
+                rationale_for_prep = segments
+
         inp_ids, tgt_ids, rat_mask, ans_mask = self.text_processor.prepare_input_sequence(
-            question, answer, rationale
+            question, answer, rationale_for_prep
         )
 
         aux_labels = self._generate_aux_labels(metadata_list)
@@ -287,7 +300,8 @@ def train(model, text_processor, runtime, args):
             label = f"Epoch {epoch + 1}/{args.epochs}"
 
         dataset = ShapeDataset(args.samples_per_epoch, text_processor,
-                               mixture=mixture, use_cot=not args.no_cot)
+                               mixture=mixture, use_cot=not args.no_cot,
+                               correction_p=args.correction_p)
         train_loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -398,6 +412,9 @@ def main():
     parser.add_argument("--try_fp8", action="store_true")
     parser.add_argument("--no_cot", action="store_true",
                         help="ablation: train with empty <THINK> spans")
+    parser.add_argument("--correction_p", type=float, default=0.0,
+                        help="probability of injecting a corrupted fact + oracle "
+                             "correction into a training trace (self-correction)")
     parser.add_argument("--no_perception_warmup", action="store_true",
                         help="skip the 1-epoch aux-only perception warm-up")
     args = parser.parse_args()
