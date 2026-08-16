@@ -18,6 +18,12 @@ checked:
   ``qualifying ...`` line of a compositional chain names an object that really
   starts a valid chain from that level onwards (re-derived here by a top-down
   existential search, not by the generator's cascade);
+* a ``relative_count`` referent is resolved from the scene here, not read off
+  the trace: one match makes the question answerable and the trace must exclude
+  the referent from its own candidates, two or more make it unanswerable as
+  posed and the trace must stop at ``ambiguous`` with an answer that asks the
+  question back ("which red triangle"). A trace that answers the other regime
+  than the scene dictates is rejected;
 * the final answer equals the independently recomputed ground truth and is
   consistent with the trace's found / none found step.
 
@@ -58,6 +64,9 @@ from shapes import (
     grid_row,
 )
 from questions import (
+    AMBIGUOUS_MARKER,
+    AMBIGUOUS_TARGET_PROB,
+    CLARIFY_PREFIX,
     CORRECTION_MARKER,
     CORRECTION_RESERVE,
     DIFFICULTY_MAP,
@@ -250,6 +259,7 @@ Q_PATTERNS = {
         rf"what is the difference between the number of ({DESC}) and "
         rf"the number of ({DESC})$"),
     'ordinal': re.compile(rf"what shape is ({ORD}) from the ({SIDE})$"),
+    'relative_count': re.compile(rf"how many ({DESC}) are ({REL}) the ({DESC})$"),
 }
 Q_PATTERNS.update({f'compositional_h{h}': chain_question_pattern(h)
                    for h in CHAIN_DEPTHS})
@@ -267,7 +277,7 @@ CMP_STEP = re.compile(r"(\d+) (greater than|less than|equal to) (\d+)$")
 PARITY_STEP = re.compile(r"(\d+) is (even|odd)$")
 DIFF_STEP = re.compile(r"difference is (\d+)$")
 ORDINAL_STEP = re.compile(rf"({ORD}) from ({SIDE}) is ({SHAPE_ALT})$")
-PLAIN_STEPS = {'found', 'none found'}
+PLAIN_STEPS = {'found', 'none found', AMBIGUOUS_MARKER}
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +648,69 @@ def check_ordinal(q, a, r, meta):
         raise SampleError(f"answer {a!r} != ground truth {truth!r}")
 
 
+def check_relative_count(q, a, r, meta):
+    """'how many circles are below the red triangle'.
+
+    Which of the two regimes the sample belongs to is decided here, from the
+    scene: the referent descriptor is matched against the metadata and the count
+    of matches -- not anything the trace says -- selects the structure the trace
+    and the answer must have. A unique-referent trace carrying an ambiguous
+    answer, or the reverse, is therefore rejected by construction.
+    """
+    m = parse_question('relative_count', q)
+    desc_x, rel, desc_ref = parse_desc(m.group(1)), m.group(2), parse_desc(m.group(3))
+    x_noun, ref_noun = m.group(1).split()[-1], m.group(3).split()[-1]
+    if x_noun == SINGULAR[x_noun]:
+        raise SampleError(f"the counted descriptor {m.group(1)!r} is not plural")
+    if ref_noun != SINGULAR[ref_noun] or desc_ref[1] is None:
+        raise SampleError(f"the referent {m.group(3)!r} must name one shape "
+                          f"in the singular")
+    if desc_x == desc_ref:
+        raise SampleError(f"the counted set and the referent are the same "
+                          f"descriptor {desc_text(desc_ref)!r}")
+
+    referents = select(meta, desc_ref)
+    if not referents:
+        raise SampleError(f"referent {desc_text(desc_ref)!r} matches no object: "
+                          f"the empty regime must never be drawn")
+
+    cur = Cursor(r)
+    cur.enumerate_set(referents, desc_text(desc_ref, True))
+
+    # ---- ambiguous regime: the question has no answer as posed --------------
+    if len(referents) > 1:
+        cur.take_count_of(desc_ref, len(referents))
+        cur.expect(AMBIGUOUS_MARKER)
+        cur.expect_end()
+        want = f"{CLARIFY_PREFIX} {desc_text(desc_ref)}"
+        if a != want:
+            raise SampleError(f"answer {a!r} != {want!r}: {len(referents)} objects "
+                              f"match the referent, so the answer must ask back "
+                              f"with the referent's own descriptor")
+        return
+
+    # ---- unique regime: count the candidates on the named side -------------
+    # Nothing lies left of, right of, above or below itself, so the referent is
+    # not a candidate even when it matches the counted descriptor. Excluding it
+    # by identity is exact here: any other object with the referent's color and
+    # shape would match the referent descriptor too, and would have put this
+    # sample in the ambiguous regime.
+    referent = referents[0]
+    candidates = [o for o in select(meta, desc_x) if o is not referent]
+    qualifying = [o for o in candidates if relation(o, referent, rel)]
+
+    cur.enumerate_set(candidates, desc_text(desc_x, True))
+    for o in qualifying:
+        row, col = cell(o)
+        cur.expect(f"qualifying {desc_text(desc_x)} at row {row} col {col}")
+    cur.take_count(len(qualifying))
+    cur.expect_end()
+    if a != str(len(qualifying)):
+        raise SampleError(f"answer {a!r} != ground truth {len(qualifying)} "
+                          f"({len(candidates)} candidates, {rel} the referent at "
+                          f"{cell(referent)})")
+
+
 def check_chain(q, a, r, meta, hops: int):
     """Compositional chain of `hops` relation hops.
 
@@ -697,6 +770,7 @@ CHECKERS = {
     'comparison': check_comparison,
     'count_difference': check_count_difference,
     'ordinal': check_ordinal,
+    'relative_count': check_relative_count,
 }
 CHECKERS.update({
     f'compositional_h{h}': (lambda hops: lambda q, a, r, meta: check_chain(q, a, r, meta, hops))(h)
@@ -704,7 +778,7 @@ CHECKERS.update({
 })
 
 # Types whose answer is not yes/no (their spread is reported instead).
-OPEN_ANSWER_TYPES = {'counting', 'count_difference', 'ordinal'}
+OPEN_ANSWER_TYPES = {'counting', 'count_difference', 'ordinal', 'relative_count'}
 YES_NO_TYPES = set(CHECKERS) - OPEN_ANSWER_TYPES
 
 
@@ -1229,6 +1303,19 @@ def main() -> int:
     print(f"ordinal answer distribution:   "
           f"{dict(sorted(stats['ordinal']['answers'].items()))}")
 
+    rc_answers = stats['relative_count']['answers']
+    rc_total = max(1, sum(rc_answers.values()))
+    rc_ambiguous = sum(c for k, c in rc_answers.items()
+                       if k.startswith(f"{CLARIFY_PREFIX} "))
+    rc_counts = Counter({k: c for k, c in rc_answers.items() if k.isdigit()})
+    print(f"relative_count regimes: unique referent "
+          f"{100.0 * (rc_total - rc_ambiguous) / rc_total:.1f}%  ambiguous "
+          f"{100.0 * rc_ambiguous / rc_total:.1f}%  (target "
+          f"{100 * (1 - AMBIGUOUS_TARGET_PROB):.0f}/"
+          f"{100 * AMBIGUOUS_TARGET_PROB:.0f}; scenes too sparse for an "
+          f"ambiguous referent decline instead)")
+    print(f"relative_count unique-regime distribution: {numeric_spread(rc_counts)}")
+
     total_scenes = sum(scene_sizes.values())
     print(f"achieved scene density over {total_scenes} scenes "
           f"(requested uniform {MIN_OBJECTS}..{MAX_OBJECTS}):")
@@ -1295,6 +1382,13 @@ def main() -> int:
                                 f"(yes={100 * yes_share:.1f}%)")
     if counting_answers.get('0', 0) == 0:
         problems.append("counting: a count of 0 never occurred")
+    if rc_ambiguous == 0:
+        problems.append("relative_count: the ambiguous regime never occurred")
+    if rc_total - rc_ambiguous == 0:
+        problems.append("relative_count: the unique-referent regime never occurred")
+    if not any(int(k) >= 2 for k in rc_counts):
+        problems.append("relative_count: no count above 1 ever occurred, the "
+                        "answers collapse onto 0/1")
     if args.correction_p > 0 and total_applied == 0:
         problems.append("correction injection never applied to a single sample")
     if global_max_len > MAX_SEQ_LEN:

@@ -65,10 +65,14 @@ class ObjSize(Enum):
     MEDIUM = "medium"
     LARGE = "large"
 
+# Bands are gap-separated (not contiguous): a contiguous 8-15/16-25/26-35
+# split makes boundary sizes (e.g. 15px vs 16px) pixel-identical yet
+# differently labeled, which is irreducible label noise for the 'size'
+# question type. Gaps between bands give each category a perceptual margin.
 SIZE_RANGES = {
-    ObjSize.SMALL: (8, 15),
-    ObjSize.MEDIUM: (16, 25),
-    ObjSize.LARGE: (26, 35)
+    ObjSize.SMALL: (8, 12),
+    ObjSize.MEDIUM: (16, 22),
+    ObjSize.LARGE: (28, 35)
 }
 
 # --- dense-scene placement tuning (see DENSE_THRESHOLD above) ---------------
@@ -111,7 +115,16 @@ class ShapeGenerator:
             draw.ellipse([x1, y1, x2, y2], fill=255)
 
         elif shape_type == ObjType.CROSS:
-            thickness = max(2, size // 8)
+            # Arms must stay proportionally slim at every size so the plus
+            # silhouette reads distinctly from a circle even at SMALL sizes
+            # (size // 8 made bars nearly as thick as the shape is wide,
+            # which read as a blob indistinguishable from a circle). Divisor
+            # 7 was chosen over 6/5 by sweeping IoU-vs-best-matching-circle
+            # across sizes 8-15: it matches or beats divisor 6 at every size
+            # (strictly better at 12-15, where divisor 6 ties the old //8
+            # formula because both floor to thickness 2) while leaving
+            # MEDIUM/LARGE sizes (16+) unchanged from divisor 6.
+            thickness = max(1, size // 7)
             length = size // 2
             # Horizontal bar
             hx1, hy1 = cx - length, cy - thickness

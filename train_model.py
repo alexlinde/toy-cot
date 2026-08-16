@@ -129,12 +129,18 @@ class ShapeDataset(Dataset):
 
 
 def get_difficulty_mixture(epoch: int) -> Dict[str, float]:
-    """Curriculum as mixture weights only - all difficulties present every epoch."""
+    """Curriculum as mixture weights only - all difficulties present every epoch.
+
+    The final phase (epoch >= 4) upweights the hard bucket beyond the medium
+    plateau: the trained model's residual errors concentrate in hard-bucket
+    question types, so the long tail of training should spend more of its
+    budget there.
+    """
     if epoch < 2:
         return {'easy': 0.6, 'medium': 0.3, 'hard': 0.1}
     elif epoch < 4:
         return {'easy': 0.4, 'medium': 0.4, 'hard': 0.2}
-    return {'easy': 0.3, 'medium': 0.4, 'hard': 0.3}
+    return {'easy': 0.2, 'medium': 0.35, 'hard': 0.45}
 
 
 def get_loss_weights(epoch: int, num_epochs: int) -> Dict[str, float]:
@@ -253,6 +259,20 @@ def evaluate_teacher_forced(model, val_batches, device, autocast_ctx):
     return results
 
 
+def is_new_best(candidate, best):
+    """Lexicographic >= comparison of (answer_em, rationale_tiebreak) pairs.
+
+    True when `candidate` is strictly better on answer_em, or ties on
+    answer_em and is >= on the rationale tiebreak. Ties on both count as a
+    new best (advances to the later, more-trained checkpoint).
+    """
+    cand_em, cand_acc = candidate
+    best_em, best_acc = best
+    if cand_em != best_em:
+        return cand_em > best_em
+    return cand_acc >= best_acc
+
+
 def train(model, text_processor, runtime, args):
     device = runtime["device"]
     model = runtime["to_device"](model)
@@ -281,7 +301,8 @@ def train(model, text_processor, runtime, args):
 
     os.makedirs('checkpoints', exist_ok=True)
     log_path = args.log
-    best_val = -1.0
+    best_metrics = (-1.0, -1.0)  # (answer_em, rationale_tiebreak) sentinel
+    best_epoch = None
 
     def save_model(path):
         raw = getattr(model, '_orig_mod', model)  # unwrap torch.compile
@@ -364,6 +385,26 @@ def train(model, text_processor, runtime, args):
         nb = len(train_loader)
         val = evaluate_teacher_forced(model, val_batches, device, runtime["autocast"])
         overall_em = sum(v['answer_em'] * v['n'] for v in val.values()) / max(1, sum(v['n'] for v in val.values()))
+        # Tiebreak for when overall_em saturates at exactly 1.0: overall rationale
+        # token accuracy across val difficulties, weighted by each difficulty's n.
+        rationale_tiebreak = (sum(v['rationale_token_acc'] * v['n'] for v in val.values())
+                              / max(1, sum(v['n'] for v in val.values())))
+
+        if not is_warmup:
+            save_model(f'checkpoints/epoch_{epoch + 1}.pth')
+            candidate = (overall_em, rationale_tiebreak)
+            if is_new_best(candidate, best_metrics):
+                best_metrics = candidate
+                best_epoch = epoch + 1
+                save_model('checkpoints/best.pth')
+                with open('checkpoints/best_epoch.txt', 'w') as f:
+                    f.write(f"epoch {best_epoch} answer_em {best_metrics[0]:.3f} "
+                            f"rationale_acc {best_metrics[1]:.3f}\n")
+                print(f"  new best (epoch {best_epoch}): answer EM {best_metrics[0]:.3f} "
+                      f"rationale acc {best_metrics[1]:.3f}")
+
+        best_so_far = ({'epoch': best_epoch, 'answer_em': best_metrics[0],
+                         'rationale_acc': best_metrics[1]} if best_epoch is not None else None)
 
         record = {
             'epoch': epoch,
@@ -377,6 +418,7 @@ def train(model, text_processor, runtime, args):
             'lr': optimizer.param_groups[0]['lr'],
             'val': val,
             'val_answer_em_overall': overall_em,
+            'best_so_far': best_so_far,
             'epoch_seconds': time.time() - t0,
         }
         with open(log_path, 'a') as f:
@@ -388,15 +430,6 @@ def train(model, text_processor, runtime, args):
         for diff, v in val.items():
             print(f"  val[{diff}]: answer EM {v['answer_em']:.3f}  "
                   f"rationale token acc {v['rationale_token_acc']:.3f}")
-
-        if not is_warmup:
-            save_model(f'checkpoints/epoch_{epoch + 1}.pth')
-            # >= so ties advance to the later (more-trained) checkpoint; strict >
-            # froze best.pth at the first epoch that hit EM 1.0
-            if overall_em >= best_val:
-                best_val = overall_em
-                save_model('checkpoints/best.pth')
-                print(f"  new best val answer EM: {best_val:.3f}")
 
     return model
 

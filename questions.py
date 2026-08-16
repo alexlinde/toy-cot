@@ -20,6 +20,7 @@ Trace conventions
 * chain resolution:      ``qualifying {desc} at row {r} col {c}``
                          then ``found`` (yes) or ``none found`` (no)
 * ordinal:               ``{ordinal} from {side} is {shape}``
+* unresolvable referent: ``ambiguous`` (answer ``which {desc}``)
 * correction:            ``wait`` (see inject_correction)
 
 All spatial ground truth is computed from the quantized grid coordinates
@@ -53,6 +54,12 @@ ORDINALS: List[str] = ['first', 'second', 'third', 'fourth']
 # Head noun used when a descriptor names only a color ("red shape").
 GENERIC_NOUN = 'shape'
 
+# A question that points at "the triangle" names nothing definite when the scene
+# holds three of them. relative_count traces close such a draw with this marker
+# instead of a count, and the answer asks the question back.
+AMBIGUOUS_MARKER = 'ambiguous'
+CLARIFY_PREFIX = 'which'
+
 # Compositional chain depths (number of relation hops) that get their own
 # generator, so the evaluator reports one accuracy bucket per depth.
 CHAIN_DEPTHS: List[int] = [2, 3, 4]
@@ -63,7 +70,7 @@ DIFFICULTY_MAP: Dict[str, List[str]] = {
                'parity'],
     'hard': (['comparison']
              + [f'compositional_h{h}' for h in CHAIN_DEPTHS]
-             + ['count_difference', 'ordinal']),
+             + ['count_difference', 'ordinal', 'relative_count']),
 }
 
 # Literal template words that are not derivable from the lists above.
@@ -115,6 +122,24 @@ DIFFERENCE_ATTEMPTS = 40
 # Share of count-difference draws that deliberately pair a broad descriptor
 # with a narrow one (the only way to reach a large difference).
 DIFFERENCE_SPREAD_PROB = 0.5
+
+# --- relative_count -------------------------------------------------------
+# Share of relative_count draws aimed at the *ambiguous* regime, where the
+# referent descriptor matches two or more objects and the question therefore has
+# no answer as posed. The rest aim at a unique referent and a real count.
+AMBIGUOUS_TARGET_PROB = 0.3
+# Descriptor kinds the referent may take. It is introduced with a definite
+# article, so a bare color ("the red shape") is not offered: the type is about
+# resolving a named object, not about a vaguer one.
+REFERENT_KINDS: Sequence[str] = ('shape', 'color_shape')
+# Largest count the unique-referent regime aims for. Targets are drawn uniformly
+# from 0..this so the answers spread instead of piling up on 0 and 1.
+RELATIVE_COUNT_TARGET_MAX = 5
+# Share of relative_count draws that count a deliberately broad descriptor
+# ('circles', 'red shapes'): a narrow color+shape set rarely puts more than one
+# object on one side of the referent.
+RELATIVE_COUNT_BROAD_PROB = 0.6
+RELATIVE_COUNT_ATTEMPTS = 40
 
 
 def pluralize(word: str) -> str:
@@ -478,6 +503,7 @@ class RationaleGenerator:
             'compositional_h4': self.generate_compositional_h4_qa,
             'count_difference': self.generate_count_difference_qa,
             'ordinal': self.generate_ordinal_qa,
+            'relative_count': self.generate_relative_count_qa,
         }
 
     # ------------------------------------------------------------------
@@ -1010,6 +1036,110 @@ class RationaleGenerator:
         return candidate if _fits(candidate) else (None, None, None)
 
     # ------------------------------------------------------------------
+    # 12. relative count (hard)
+    # ------------------------------------------------------------------
+
+    def _draw_relative_count(self, metadata_list: Sequence[Dict[str, Any]],
+                             want_ambiguous: bool) -> Optional[Tuple[str, str, str]]:
+        """One draw of 'how many {X} are {rel} the {REF}', or None to re-draw.
+
+        The referent is always anchored on an object of the scene, so it matches
+        at least once; which regime the draw lands in is then decided by the
+        scene alone, and a draw that misses the wanted regime is rejected:
+
+        * exactly one match  -- the question is answerable. The trace states the
+          referent, enumerates the X candidates (the referent itself excluded:
+          nothing stands left of, right of, above or below itself), lists the
+          ones that satisfy the relation, and counts them.
+        * two or more        -- 'the triangle' resolves to no single object. The
+          trace enumerates every referent candidate, states how many there are,
+          and stops at ``ambiguous``; the answer asks the question back.
+        """
+        anchor = random.choice(list(metadata_list))
+        desc_ref = self._descriptor_from(anchor['color'], anchor['shape'],
+                                         REFERENT_KINDS)
+        referents = filter_objects(metadata_list, desc_ref)
+        if (len(referents) >= 2) != want_ambiguous:
+            return None
+
+        # A broad counted descriptor is what makes counts above one reachable;
+        # the rest of the draws keep the question surface varied.
+        if random.random() < RELATIVE_COUNT_BROAD_PROB:
+            desc_x = self._draw_descriptor(metadata_list, kinds=('shape', 'color'),
+                                           grounded_prob=0.9)
+        else:
+            desc_x = self._draw_descriptor(metadata_list)
+        if desc_x == desc_ref:
+            return None  # 'how many triangles are below the triangle'
+        relation = random.choice(RELATIONS)
+
+        question = (f"how many {desc_x.text(True)} are {relation} "
+                    f"the {desc_ref.text()}")
+        steps = enumeration_steps(referents, f"no {desc_ref.text(True)} found")
+
+        if want_ambiguous:
+            steps.append(f"count of {desc_ref.text(True)} is {len(referents)}")
+            steps.append(AMBIGUOUS_MARKER)
+            return (question, f"{CLARIFY_PREFIX} {desc_ref.text()}",
+                    ' . '.join(steps))
+
+        referent = referents[0]
+        candidates = [m for m in filter_objects(metadata_list, desc_x)
+                      if m is not referent]
+        qualifying = [m for m in candidates
+                      if relation_holds(m, referent, relation)]
+
+        steps += enumeration_steps(candidates, f"no {desc_x.text(True)} found")
+        for m in qualifying:
+            row, col = cell_of(m)
+            steps.append(f"qualifying {desc_x.text()} at row {row} col {col}")
+        steps.append(f"count is {len(qualifying)}")
+
+        return question, str(len(qualifying)), ' . '.join(steps)
+
+    def generate_relative_count_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """'how many circles are below the red triangle' -- resolve the referent,
+        then count the candidates on the named side of it.
+
+        Balancing draws the regime first (AMBIGUOUS_TARGET_PROB of the time the
+        unanswerable one) and then re-draws descriptors and relation until the
+        scene delivers it; a scene that cannot -- a single object can never make
+        a referent ambiguous -- declines rather than answer a different question
+        than the one that was asked for.
+
+        Inside the unique-referent regime the loop aims at a count drawn
+        uniformly from 0..RELATIVE_COUNT_TARGET_MAX and, when no draw reaches it,
+        keeps the draw that came *closest* rather than the last one seen. Keeping
+        the last would hand back a plain unbiased draw, and plain draws pile up
+        on 0 and 1: nothing stands to the left of a referent on the left edge.
+        """
+        if not metadata_list:
+            return None, None, None
+
+        want_ambiguous = random.random() < AMBIGUOUS_TARGET_PROB
+        target = random.randint(0, RELATIVE_COUNT_TARGET_MAX)
+        fallback: Optional[Tuple[str, str, str]] = None
+        fallback_gap = 0
+
+        for _ in range(RELATIVE_COUNT_ATTEMPTS):
+            candidate = self._draw_relative_count(metadata_list, want_ambiguous)
+            if candidate is None or not _fits(candidate):
+                continue
+            # Every ambiguous draw is as good as any other; a unique-referent
+            # draw is kept early only when it hits the count the loop aims for.
+            if want_ambiguous:
+                return candidate
+            gap = abs(int(candidate[1]) - target)
+            if fallback is None or gap < fallback_gap:
+                fallback, fallback_gap = candidate, gap
+            if gap == 0:
+                return candidate
+
+        if fallback is not None:
+            return fallback
+        return None, None, None
+
+    # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
@@ -1081,6 +1211,11 @@ class RationaleGenerator:
         # self-correction marker (only ever emitted by inject_correction, but
         # the tokenizer must know it whether or not corrections are enabled)
         words.add(CORRECTION_MARKER)
+
+        # unresolvable referent: the trace marker and the ask-back answer
+        # ('which red triangle' -- the descriptor words are already covered)
+        words.add(AMBIGUOUS_MARKER)
+        words.add(CLARIFY_PREFIX)
 
         # literal template words
         words.update(TEMPLATE_WORDS)
