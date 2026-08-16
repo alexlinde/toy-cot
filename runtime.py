@@ -113,7 +113,7 @@ def setup_runtime(prefer_compile=True, try_fp8=False, target_eff_batch=None):
         )
         return opt
 
-    def make_optimizer_from_groups(param_groups, lr, device_type="cuda"):
+    def make_optimizer_from_groups(param_groups, lr):
         return torch.optim.AdamW(
             param_groups,
             lr=lr, betas=(0.9, 0.95), eps=1e-8,

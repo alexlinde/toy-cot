@@ -1,80 +1,126 @@
 """
 Evaluation suite for the Toy VLM with Chain-of-Thought reasoning.
-Tests the model on various question types and measures exact match accuracy.
+Tests the model on various question types and measures exact match accuracy,
+aggregated by difficulty, with majority-class baselines for context.
 """
 
-import torch
-import numpy as np
-from typing import Dict, List, Tuple
-from tqdm import tqdm
-from shapes import ShapeGenerator
-from questions import RationaleGenerator
-from text import TextProcessor, SimpleTokenizer, NUM_IMG_TOKENS
-from model import ToyVLM, generate_response, DEVICE
+import argparse
+import json
+import os
 import random
+import sys
+from collections import Counter
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from shapes import ShapeGenerator, MIN_OBJECTS, MAX_OBJECTS
+from questions import RationaleGenerator, DIFFICULTY_MAP
+from text import TextProcessor, SimpleTokenizer, MAX_SEQ_LEN
+from model import ToyVLM, generate_response
+
+
+def best_device() -> torch.device:
+    """Pick the best available device: cuda -> mps -> cpu."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
 
 class VLMEvaluator:
-    """Evaluates VLM on generated test sets."""
+    """Evaluates VLM on generated test sets, per question type and difficulty."""
 
-    def __init__(self, model, text_processor):
+    def __init__(self, model: ToyVLM, text_processor: TextProcessor):
         self.model = model
         self.text_processor = text_processor
         self.shape_gen = ShapeGenerator()
         self.rationale_gen = RationaleGenerator()
+        self.device = next(model.parameters()).device
 
-    def generate_test_set(self, num_samples: int, difficulty: str) -> List[Dict]:
-        """Generate a test set with ground truth."""
+    @staticmethod
+    def normalize_answer(answer: str) -> str:
+        """Normalize answer for comparison."""
+        if answer is None:
+            return ""
+        return answer.lower().strip().replace('.', '').replace(',', '')
+
+    def exact_match(self, predicted: str, ground_truth: str) -> bool:
+        return self.normalize_answer(predicted) == self.normalize_answer(ground_truth)
+
+    def _make_scene(self) -> Tuple[Any, List[Dict[str, Any]]]:
+        num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
+        image, metadata = self.shape_gen.generate_multi_shape_image(num_shapes, add_noise=False)
+        return image, metadata
+
+    def generate_test_set(self, qtype: str, generator_fn, num_samples: int) -> List[Dict[str, Any]]:
+        """Generate a test set of `num_samples` for a single question type,
+        resampling scenes whenever the generator declines (None, None, None)."""
         test_samples = []
+        # Guard against pathological generators that can never produce a question
+        # for the shapes on offer; bail out after a generous number of attempts.
+        max_attempts = num_samples * 50 + 100
+        attempts = 0
 
-        for _ in range(num_samples):
-            # Generate multi-shape image
-            num_shapes = random.randint(1, 4)
-            image, metadata = self.shape_gen.generate_multi_shape_image(num_shapes, False)
-
-            # Generate question with ground truth rationale and answer
-            question, answer, rationale = self.rationale_gen.generate_qa_with_rationale(
-                metadata, difficulty=difficulty
-            )
-
+        while len(test_samples) < num_samples and attempts < max_attempts:
+            attempts += 1
+            image, metadata = self._make_scene()
+            question, answer, rationale = generator_fn(metadata)
+            if question is None or answer is None or rationale is None:
+                continue
             test_samples.append({
                 'image': image,
                 'metadata': metadata,
                 'question': question,
                 'ground_truth_answer': answer,
-                'ground_truth_rationale': rationale
+                'ground_truth_rationale': rationale,
             })
+
+        if len(test_samples) < num_samples:
+            print(
+                f"  Warning: only generated {len(test_samples)}/{num_samples} samples "
+                f"for question type '{qtype}' after {attempts} attempts"
+            )
 
         return test_samples
 
-    def normalize_answer(self, answer: str) -> str:
-        """Normalize answer for comparison."""
-        return answer.lower().strip().replace('.', '').replace(',', '')
+    def _to_model_image(self, img) -> torch.Tensor:
+        """Convert an (H, W, 3) uint8 RGB image into the (3, 64, 64) float32 [0,1]
+        tensor expected by generate_response."""
+        return torch.tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
 
-    def evaluate_exact_match(self, predicted: str, ground_truth: str) -> bool:
-        """Check if predicted answer matches ground truth (exact match)."""
-        return self.normalize_answer(predicted) == self.normalize_answer(ground_truth)
-
-    def evaluate_test_set(self, test_samples: List[Dict], show_examples: int) -> Tuple[Dict[str, float], List[Dict]]:
-        """Evaluate model on test set and return metrics."""
+    def evaluate_test_set(
+        self, qtype: str, test_samples: List[Dict[str, Any]], show_examples: int
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Evaluate model on a single question type's test set and return metrics."""
         self.model.eval()
 
         correct = 0
+        rationale_correct = 0
         total = len(test_samples)
         empty_predictions = 0
         generation_errors = 0
 
         results = []
+        gt_answers = []
 
-        print(f"\nEvaluating on {total} samples...")
-        for i, sample in enumerate(tqdm(test_samples)):
-            image = sample['image']
+        for i, sample in enumerate(tqdm(test_samples, desc=qtype, leave=False)):
             question = sample['question']
             gt_answer = sample['ground_truth_answer']
+            gt_rationale = sample['ground_truth_rationale']
+            gt_answers.append(gt_answer)
 
-            # Grayscale image: (H,W) -> (1,H,W)
-            img = torch.tensor(image, dtype=torch.float32).unsqueeze(0) / 255.0 # (1,H,W)
+            img = self._to_model_image(sample['image'])
 
-            # Generate prediction
             try:
                 pred_rationale, pred_answer = generate_response(
                     self.model, img, question, max_length=35, return_rationale=True
@@ -87,113 +133,249 @@ class VLMEvaluator:
                 pred_rationale, pred_answer = "", ""
                 generation_errors += 1
 
-            # Check exact match
-            is_correct = self.evaluate_exact_match(pred_answer, gt_answer)
+            is_correct = self.exact_match(pred_answer, gt_answer)
             if is_correct:
                 correct += 1
+
+            is_rationale_correct = self.exact_match(pred_rationale, gt_rationale)
+            if is_rationale_correct:
+                rationale_correct += 1
 
             results.append({
                 'question': question,
                 'ground_truth_answer': gt_answer,
                 'predicted_answer': pred_answer,
-                'ground_truth_rationale': sample['ground_truth_rationale'],
+                'ground_truth_rationale': gt_rationale,
                 'predicted_rationale': pred_rationale,
-                'correct': is_correct
+                'correct': is_correct,
+                'rationale_correct': is_rationale_correct,
             })
 
-            # Show examples
             if i < show_examples:
-                print(f"\n--- Example {i+1} ---")
+                print(f"\n--- {qtype} example {i + 1} ---")
                 print(f"Question: {question}")
                 print(f"GT Answer: {gt_answer}")
                 print(f"Pred Answer: {pred_answer}")
-                print(f"GT Rationale: {sample['ground_truth_rationale']}")
+                print(f"GT Rationale: {gt_rationale}")
                 print(f"Pred Rationale: {pred_rationale}")
                 print(f"Correct: {is_correct}")
 
         accuracy = correct / total if total > 0 else 0.0
+        rationale_exact = rationale_correct / total if total > 0 else 0.0
+
+        majority_count = Counter(self.normalize_answer(a) for a in gt_answers).most_common(1)
+        majority_baseline = (majority_count[0][1] / total) if total > 0 and majority_count else 0.0
 
         metrics = {
+            'type': qtype,
+            'n': total,
             'accuracy': accuracy,
-            'correct': correct,
-            'total': total,
-            'empty_predictions': empty_predictions,
-            'generation_errors': generation_errors,
-            'empty_rate': empty_predictions / total if total > 0 else 0.0,
-            'error_rate': generation_errors / total if total > 0 else 0.0
+            'majority_baseline': majority_baseline,
+            'rationale_exact': rationale_exact,
+            'empty': empty_predictions,
+            'errors': generation_errors,
         }
 
         return metrics, results
 
-    def evaluate_by_difficulty(self, num_samples_per_difficulty: int):
-        """Evaluate on all difficulty levels."""
-        difficulties = ['easy', 'medium', 'hard']
-        all_metrics = {}
+    def evaluate_all_types(
+        self, num_samples_per_type: int, show_examples: int
+    ) -> Dict[str, Dict[str, Any]]:
+        """Evaluate on every question type registered on the rationale generator."""
+        per_type_metrics: Dict[str, Dict[str, Any]] = {}
 
-        for difficulty in difficulties:
-            print(f"\n{'='*60}")
-            print(f"Evaluating on {difficulty.upper()} questions")
-            print('='*60)
+        for qtype, generator_fn in self.rationale_gen.generators.items():
+            print(f"\n{'=' * 60}")
+            print(f"Evaluating question type: {qtype}")
+            print('=' * 60)
 
-            test_set = self.generate_test_set(num_samples_per_difficulty, difficulty)
-            metrics, results = self.evaluate_test_set(test_set, show_examples=5)
+            test_set = self.generate_test_set(qtype, generator_fn, num_samples_per_type)
+            if not test_set:
+                print(f"  Skipping '{qtype}': no valid samples could be generated.")
+                continue
 
-            all_metrics[difficulty] = metrics
+            metrics, _ = self.evaluate_test_set(qtype, test_set, show_examples)
+            per_type_metrics[qtype] = metrics
 
-            print(f"\n{difficulty.upper()} Results:")
-            print(f"  Accuracy: {metrics['accuracy']:.2%} ({metrics['correct']}/{metrics['total']})")
-            if metrics.get('empty_predictions', 0) > 0:
-                print(f"  Empty predictions: {metrics['empty_predictions']} ({metrics['empty_rate']:.1%})")
-            if metrics.get('generation_errors', 0) > 0:
-                print(f"  Generation errors: {metrics['generation_errors']} ({metrics['error_rate']:.1%})")
+            print(
+                f"\n{qtype}: acc {metrics['accuracy']:.1%}  "
+                f"majority {metrics['majority_baseline']:.1%}  "
+                f"rationale_exact {metrics['rationale_exact']:.1%}  "
+                f"(n={metrics['n']}, empty={metrics['empty']}, errors={metrics['errors']})"
+            )
 
-        # Overall summary
-        print(f"\n{'='*60}")
-        print("OVERALL SUMMARY")
-        print('='*60)
-        total_correct = sum(all_metrics[d]['correct'] for d in difficulties)
-        total_samples = sum(all_metrics[d]['total'] for d in difficulties)
-        overall_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        return per_type_metrics
 
-        for difficulty in difficulties:
-            metrics = all_metrics[difficulty]
-            print(f"{difficulty.capitalize():8s}: {metrics['accuracy']:.2%} ({metrics['correct']}/{metrics['total']})")
+    @staticmethod
+    def aggregate_by_difficulty(
+        per_type_metrics: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Roll per-type metrics up into per-difficulty metrics using DIFFICULTY_MAP."""
+        by_difficulty: Dict[str, Dict[str, Any]] = {}
 
-        print(f"{'Overall':8s}: {overall_accuracy:.2%} ({total_correct}/{total_samples})")
+        for difficulty, qtypes in DIFFICULTY_MAP.items():
+            n = 0
+            correct = 0
+            rationale_correct = 0
+            majority_correct = 0
+            empty = 0
+            errors = 0
 
-        return all_metrics
+            for qtype in qtypes:
+                m = per_type_metrics.get(qtype)
+                if m is None:
+                    continue
+                n += m['n']
+                correct += m['accuracy'] * m['n']
+                rationale_correct += m['rationale_exact'] * m['n']
+                majority_correct += m['majority_baseline'] * m['n']
+                empty += m['empty']
+                errors += m['errors']
+
+            if n == 0:
+                continue
+
+            by_difficulty[difficulty] = {
+                'type': difficulty,
+                'n': n,
+                'accuracy': correct / n,
+                'majority_baseline': majority_correct / n,
+                'rationale_exact': rationale_correct / n,
+                'empty': empty,
+                'errors': errors,
+            }
+
+        return by_difficulty
+
+    @staticmethod
+    def aggregate_overall(per_type_metrics: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        n = sum(m['n'] for m in per_type_metrics.values())
+        if n == 0:
+            return {
+                'type': 'overall', 'n': 0, 'accuracy': 0.0,
+                'majority_baseline': 0.0, 'rationale_exact': 0.0,
+                'empty': 0, 'errors': 0,
+            }
+
+        correct = sum(m['accuracy'] * m['n'] for m in per_type_metrics.values())
+        rationale_correct = sum(m['rationale_exact'] * m['n'] for m in per_type_metrics.values())
+        majority_correct = sum(m['majority_baseline'] * m['n'] for m in per_type_metrics.values())
+        empty = sum(m['empty'] for m in per_type_metrics.values())
+        errors = sum(m['errors'] for m in per_type_metrics.values())
+
+        return {
+            'type': 'overall',
+            'n': n,
+            'accuracy': correct / n,
+            'majority_baseline': majority_correct / n,
+            'rationale_exact': rationale_correct / n,
+            'empty': empty,
+            'errors': errors,
+        }
 
 
-def main():
-    """Run evaluation on trained model."""
+def print_summary(
+    per_type_metrics: Dict[str, Dict[str, Any]],
+    per_difficulty_metrics: Dict[str, Dict[str, Any]],
+    overall_metrics: Dict[str, Any],
+) -> None:
+    print(f"\n{'=' * 72}")
+    print("SUMMARY BY QUESTION TYPE")
+    print('=' * 72)
+    print(f"{'type':28s} {'n':>5s} {'acc':>8s} {'majority':>10s} {'rat.exact':>10s} {'empty':>7s} {'errors':>7s}")
+    for qtype, m in per_type_metrics.items():
+        print(
+            f"{qtype:28s} {m['n']:5d} {m['accuracy']:7.1%} {m['majority_baseline']:9.1%} "
+            f"{m['rationale_exact']:9.1%} {m['empty']:7d} {m['errors']:7d}"
+        )
+
+    print(f"\n{'=' * 72}")
+    print("SUMMARY BY DIFFICULTY")
+    print('=' * 72)
+    print(f"{'difficulty':28s} {'n':>5s} {'acc':>8s} {'majority':>10s} {'rat.exact':>10s}")
+    for difficulty, m in per_difficulty_metrics.items():
+        print(
+            f"{difficulty:28s} {m['n']:5d} {m['accuracy']:7.1%} {m['majority_baseline']:9.1%} "
+            f"{m['rationale_exact']:9.1%}"
+        )
+
+    print(f"\n{'=' * 72}")
+    print("OVERALL")
+    print('=' * 72)
+    print(
+        f"n={overall_metrics['n']}  accuracy={overall_metrics['accuracy']:.1%}  "
+        f"majority_baseline={overall_metrics['majority_baseline']:.1%}  "
+        f"rationale_exact={overall_metrics['rationale_exact']:.1%}  "
+        f"empty={overall_metrics['empty']}  errors={overall_metrics['errors']}"
+    )
+
+
+def write_results(
+    out_path: str,
+    per_type_metrics: Dict[str, Dict[str, Any]],
+    overall_metrics: Dict[str, Any],
+) -> None:
+    fields = ['type', 'n', 'accuracy', 'majority_baseline', 'rationale_exact', 'empty', 'errors']
+    with open(out_path, 'w') as f:
+        for m in per_type_metrics.values():
+            f.write(json.dumps({k: m[k] for k in fields}) + '\n')
+        f.write(json.dumps({k: overall_metrics[k] for k in fields}) + '\n')
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate the Toy VLM with chain-of-thought reasoning.")
+    parser.add_argument('--checkpoint', type=str, default='toy_vlm_cot.pth')
+    parser.add_argument('--vocab', type=str, default='tokenizer_vocab.json')
+    parser.add_argument('--samples', type=int, default=500, help='Samples per question type')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--out', type=str, default='eval_results.jsonl')
+    parser.add_argument('--show-examples', type=int, default=3)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    if not os.path.isfile(args.checkpoint):
+        sys.exit(
+            f"Checkpoint not found: '{args.checkpoint}'. "
+            f"Train a model first (artifacts are gitignored)."
+        )
+    if not os.path.isfile(args.vocab):
+        sys.exit(
+            f"Vocab file not found: '{args.vocab}'. "
+            f"Train a model first (artifacts are gitignored)."
+        )
+
     print("Loading model for evaluation...")
 
-    # Load tokenizer
-    tokenizer = SimpleTokenizer(vocab_file='tokenizer_vocab.json')
+    tokenizer = SimpleTokenizer()
+    tokenizer.load_vocab(args.vocab)
     text_processor = TextProcessor()
     text_processor.tokenizer = tokenizer
 
-    # Create model
     model = ToyVLM(text_processor)
+    state_dict = torch.load(args.checkpoint, map_location='cpu')
+    model.load_state_dict(state_dict)
 
-    # Load trained weights
-    try:
-        model.load_state_dict(torch.load('toy_vlm_cot.pth', map_location=DEVICE))
-        print("Loaded model weights from 'toy_vlm_cot.pth'")
-    except FileNotFoundError:
-        print("Warning: Model weights not found. Using untrained model.")
-
-    model = model.to(DEVICE)
+    device = best_device()
+    model = model.to(device)
     model.eval()
+    print(f"Loaded '{args.checkpoint}' onto device: {device}")
 
-    # Create evaluator
     evaluator = VLMEvaluator(model, text_processor)
 
-    # Run evaluation
-    all_metrics = evaluator.evaluate_by_difficulty(num_samples_per_difficulty=10)
+    per_type_metrics = evaluator.evaluate_all_types(
+        num_samples_per_type=args.samples, show_examples=args.show_examples
+    )
+    per_difficulty_metrics = evaluator.aggregate_by_difficulty(per_type_metrics)
+    overall_metrics = evaluator.aggregate_overall(per_type_metrics)
 
-    return all_metrics
+    print_summary(per_type_metrics, per_difficulty_metrics, overall_metrics)
+    write_results(args.out, per_type_metrics, overall_metrics)
+    print(f"\nWrote results to '{args.out}'")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

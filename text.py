@@ -8,40 +8,58 @@ import re
 import json
 import os
 from typing import List, Set
-import torch
-from shapes import ObjType
+
+try:  # torch is only needed to decode tensors; the data layer must run without it
+    import torch
+except ImportError:  # pragma: no cover - exercised by torch-free tooling
+    torch = None
 
 # Token/sequence constants
-# Increased to support prefixed image tokens
-MAX_SEQ_LEN = 128
+MAX_SEQ_LEN = 192
 NUM_IMG_TOKENS = 64
+
+# Image-first layout:
+#   position 0            : <BOS>
+#   position 1            : <IMG_START>
+#   positions 2..2+63     : <IMG> placeholders
+#   position 66           : <IMG_END>
+#   position 67 onwards   : <|user|> question ...
+IMG_POS_START = 2
+PREFIX_LEN = 2 + NUM_IMG_TOKENS + 1  # 67: BOS + IMG_START + 64 <IMG> + IMG_END
 
 class SimpleTokenizer:
     """Simple word-based tokenizer for the toy VLM (word-level)."""
     
+    # The 13 fixed special tokens always occupy ids 0..12.
+    SPECIAL_TOKENS = {
+        '<PAD>': 0,
+        '<BOS>': 1,
+        '<EOS>': 2,
+        '<UNK>': 3,
+        '<|user|>': 4,
+        '<|assistant|>': 5,
+        '<THINK>': 6,
+        '</THINK>': 7,
+        '<FINAL>': 8,
+        '</FINAL>': 9,
+        '<IMG_START>': 10,
+        '<IMG_END>': 11,
+        '<IMG>': 12,
+    }
+
     def __init__(self, vocab_file: str = None):
         if vocab_file and os.path.exists(vocab_file):
             # Load pretrained vocabulary
             self.load_vocab(vocab_file)
         else:
             # Initialize with base vocabulary for dialog + image-token format
-            self.vocab = {
-                '<PAD>': 0,
-                '<BOS>': 1,
-                '<EOS>': 2,
-                '<UNK>': 3,
-                '<|user|>': 4,
-                '<|assistant|>': 5,
-                '<THINK>': 6,
-                '</THINK>': 7,
-                '<FINAL>': 8,
-                '</FINAL>': 9,
-                '<IMG_START>': 10,
-                '<IMG_END>': 11,
-                '<IMG>': 12,
-            }
-            self._update_mappings()
-    
+            self._reset_special_tokens()
+
+    def _reset_special_tokens(self):
+        """Reset the vocabulary to just the fixed special tokens."""
+        self.vocab = dict(self.SPECIAL_TOKENS)
+        self._update_mappings()
+
     def _update_mappings(self):
         """Update reverse mapping and special token IDs."""
         # Create reverse mapping
@@ -66,53 +84,31 @@ class SimpleTokenizer:
         self.img_end_id = self.vocab['<IMG_END>']
         self.img_token_id = self.vocab['<IMG>']
     
-    def build_vocab_from_rationales(self, rationale_generator, num_samples=200):
-        """Build vocabulary from RationaleGenerator for CoT reasoning."""
-        from shapes import ShapeGenerator
+    def build_vocab(self, words: Set[str]):
+        """Build a deterministic vocabulary from an explicit word set.
 
-        shape_gen = ShapeGenerator()
-        word_set = set()
+        Ids are assigned to sorted(words) after the fixed special tokens, so
+        the mapping depends only on the word set -- never on sampling luck.
+        """
+        self._reset_special_tokens()
 
-        # Generate samples for each difficulty level
-        difficulties = ['easy', 'medium', 'hard']
-        for difficulty in difficulties:
-            for _ in range(num_samples // len(difficulties)):
-                try:
-                    # Generate a multi-shape image
-                    image, metadata = shape_gen.generate_multi_shape_image(1, False)
-
-                    # Generate QA with rationale
-                    question, answer, rationale = rationale_generator.generate_qa_with_rationale(
-                        metadata, difficulty=difficulty
-                    )
-
-                    if question and answer and rationale:
-                        # Extract words from all three
-                        q_words = self._extract_words(question)
-                        a_words = self._extract_words(answer)
-                        r_words = self._extract_words(rationale)
-
-                        word_set.update(q_words)
-                        word_set.update(a_words)
-                        word_set.update(r_words)
-                except Exception as e:
-                    print(f"Warning: Could not generate QA with rationale: {e}")
-                    continue
-        # add shapes and digits 0-9
-        word_set.update({e.value for e in list(ObjType)})
-        word_set.update({str(i) for i in range(10)})
-        
-        # add common words that might be missing
-        word_set.update({'yes', 'no', 'is', 'are', 'there', 'count', 'compare', 'equal', 'greater', 'less'})
-
-        # Build vocabulary
         next_idx = len(self.vocab)
-        for word in sorted(word_set):
+        for word in sorted(words):
             if word not in self.vocab:
                 self.vocab[word] = next_idx
                 next_idx += 1
 
         self._update_mappings()
+        return self.vocab
+
+    def build_vocab_from_rationales(self, rationale_generator, num_samples=200):
+        """Build the vocabulary from a RationaleGenerator's declared word set.
+
+        `num_samples` is ignored: the vocabulary is enumerated deterministically
+        by the generator rather than sampled. The argument is kept so existing
+        call sites keep working.
+        """
+        self.build_vocab(rationale_generator.vocabulary())
         print(f"Built vocabulary with {len(self.vocab)} tokens from RationaleGenerator")
 
     def _extract_words(self, text: str) -> Set[str]:
@@ -144,9 +140,12 @@ class SimpleTokenizer:
         return tokenizer
     
     def _preprocess_text(self, text: str) -> str:
-        """Remove non-alphanumeric characters and normalize."""
-        # Convert to lowercase and keep only alphanumeric characters and spaces
-        text = re.sub(r'[^a-zA-Z0-9\s]', '', text.lower())
+        """Lowercase, keep '.' as a standalone token, drop everything else."""
+        text = text.lower()
+        # '.' is a real token (the rationale step separator)
+        text = text.replace('.', ' . ')
+        # Keep only lowercase letters, digits, dots and spaces
+        text = re.sub(r'[^a-z0-9. ]', '', text)
         # Normalize whitespace
         text = ' '.join(text.split())
         return text
@@ -177,7 +176,7 @@ class SimpleTokenizer:
     
     def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
         """Convert token IDs back to text."""
-        if isinstance(tokens, torch.Tensor):
+        if torch is not None and isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
         
         words = []
@@ -207,12 +206,15 @@ class TextProcessor:
         rationale: str = None
     ) -> tuple:
         """
-        Compose sequence per new format:
+        Compose sequence per image-first format:
 
-        input_ids  = [BOS] + [USER] + q_ids + img_block + [ASSIST]
+        input_ids  = [BOS] + img_block + [USER] + q_ids + [ASSIST]
                      + [THINK] + r_ids + [THINK_END]
                      + [FINAL] + a_ids + [FINAL_END] + [EOS]
-        target_ids = input_ids[1:] + [EOS]
+        target_ids = input_ids[1:]
+
+        The image block occupies a fixed span (positions 1..PREFIX_LEN-1), so
+        the model can build its attention mask from PREFIX_LEN/IMG_POS_START.
         """
         tok = self.tokenizer
 
@@ -224,12 +226,19 @@ class TextProcessor:
 
         input_ids = (
             [tok.bos_token_id] +
-            [tok.user_token_id] + q_tokens +
             img_block +
+            [tok.user_token_id] + q_tokens +
             [tok.assistant_token_id] +
             [tok.think_start_id] + r_tokens + [tok.think_end_id] +
             [tok.final_start_id] + a_tokens + [tok.final_end_id] +
             [tok.eos_token_id]
+        )
+
+        # A sample that overflows the context must fail loudly: silently
+        # truncating a sequence would cut the CoT supervision to pieces.
+        assert len(input_ids) <= MAX_SEQ_LEN, (
+            f"[text] Sequence of {len(input_ids)} tokens exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}. "
+            f"question={question!r} rationale={rationale!r} answer={answer!r}"
         )
 
         # Standard next-token targets: predict input_ids shifted by 1
@@ -281,13 +290,21 @@ class TextProcessor:
         eos_p = len(input_ids)-1 if len(input_ids) and input_ids[-1] == tok.eos_token_id else -1
 
         assert bos_p == 0, "[text] <BOS> must be at position 0"
-        assert usr_p > 0, "[text] Missing <|user|>"
         img_s = find_pos(tok.img_start_id)
         img_e = find_pos(tok.img_end_id)
-        assert img_s > usr_p and img_e > img_s, "[text] Invalid image block order"
+        assert img_s == 1, "[text] <IMG_START> must be at position 1"
+        assert img_e == PREFIX_LEN - 1, (
+            f"[text] <IMG_END> must be at position {PREFIX_LEN - 1}, found {img_e}"
+        )
+        assert all(t == tok.img_token_id for t in input_ids[IMG_POS_START:img_e]), (
+            f"[text] Image placeholders must fill positions {IMG_POS_START}..{img_e - 1}"
+        )
         # Check placeholders count
         num_placeholders = sum(1 for t in input_ids if t == tok.img_token_id)
         assert num_placeholders == NUM_IMG_TOKENS, f"[text] Expected {NUM_IMG_TOKENS} <IMG> tokens, found {num_placeholders}"
+        assert usr_p == PREFIX_LEN, (
+            f"[text] <|user|> must directly follow the image block at {PREFIX_LEN}, found {usr_p}"
+        )
         assert asst_p > usr_p, "[text] <|assistant|> must come after <|user|>"
         # THINK and FINAL sections exist even if empty strings were passed (they may be contiguous)
         assert th_s > asst_p and th_e > th_s, "[text] Invalid THINK span"

@@ -1,5 +1,4 @@
 torch
 numpy
 tqdm
-jinja2
 pillow

@@ -1,191 +1,139 @@
-# Toy Vision-Language Model (VLM) with Chain-of-Thought Reasoning
+# Toy VLM with Chain-of-Thought Reasoning
 
-A PyTorch implementation demonstrating multimodal AI with interpretable reasoning capabilities.
+A small, from-scratch vision-language model that answers questions about
+2D shape scenes by first writing out a step-by-step rationale and then a
+final answer -- a frontier-parallel design (inline image tokens, prefix-LM
+attention, enumerate-then-reason CoT, mixed-difficulty curriculum, auxiliary
+perception heads) shrunk down to a toy scale that trains in minutes to hours
+on a single GPU.
 
-## Project Overview
+## Architecture
 
-This toy Vision-Language Model (VLM) can understand multi-shape scenes and answer complex questions using **chain-of-thought reasoning**. The model generates step-by-step rationales before providing final answers, enabling compositional reasoning over counting, comparison, and spatial relations.
+- **~5.0M parameters total** (~140K in the vision encoder, ~86K in the
+  auxiliary count heads, the rest in the transformer decoder and tied
+  embeddings).
+- **6-layer, 4-head, 256-dim** pre-LN transformer decoder (`model.py`).
+- **Vision encoder**: a small CNN with always-on (x, y) coordinate channels
+  and a squeeze-and-excitation block, producing exactly 64 image tokens on
+  an 8x8 grid with learned 2D positional embeddings.
+- **Image-first, fixed-position layout**: the 64 image tokens are spliced
+  into the token sequence at fixed positions 2..65 (`IMG_POS_START=2`), so
+  the model never has to locate them dynamically:
+  ```
+  [BOS] <IMG_START> <IMG>x64 <IMG_END> <|user|> question <|assistant|>
+  <THINK> rationale </THINK> <FINAL> answer </FINAL> [EOS]
+  ```
+- **Prefix-LM attention**: bidirectional self-attention within the image
+  prefix (positions 0..66), causal thereafter.
+- **`MAX_SEQ_LEN = 192`**; a 73-token deterministic vocabulary built from
+  the question generator's declared word set (`text.py`,
+  `tokenizer.build_vocab_from_rationales`) -- training can never see an
+  out-of-vocabulary token.
+- **Weight-tied output head**: the LM head shares weights with the token
+  embedding.
+- **Auxiliary heads**: per-shape, per-size, and per-color count classifiers
+  (0..`MAX_OBJECTS` classes each) over pooled vision tokens, used only as an
+  auxiliary loss to help the vision encoder disentangle features.
 
-## Project Structure
+## Data
 
-- **model.py**: Neural architectures with spatial vision encoder, auxiliary heads, and CoT generation
-- **text.py**: Tokenizer with special reasoning tokens (`<REASON>`, `<SEP>`, `<FINAL>`)
-- **shapes.py**: Multi-shape RGB image generation with metadata (colors, sizes, positions)
-- **questions.py**: Template system + RationaleGenerator for program traces
-- **train_model.py**: Curriculum learning with weighted loss components
-- **test_model.py**: Interactive GUI for model inference
-- **evaluate.py**: Evaluation suite with difficulty-based testing
+Scenes are synthesized on the fly (`shapes.py`): 64x64 RGB images, 1-6
+objects per scene (`MIN_OBJECTS`/`MAX_OBJECTS`), each object one of
+**4 shapes** (square, circle, cross, triangle) x **4 colors** (red, green,
+blue, yellow) x **3 sizes** (small, medium, large), placed without overlap.
+All spatial ground truth is derived from a quantized 8x8 grid (`grid_row`/
+`grid_col`), never from raw pixel coordinates.
 
-## Key Features
+`questions.py` generates 8 question types across 3 difficulty tiers
+(`DIFFICULTY_MAP`), each with an *enumerate-then-reason* CoT rationale:
+first enumerate the objects the question needs (in raster order, with
+quantized grid coordinates), then perform the reasoning steps that lead to
+the answer. Yes/no questions are balanced to a roughly 50/50 answer prior.
 
-### 🧠 Chain-of-Thought Reasoning
-The model explains its reasoning before answering:
+| Difficulty | Question types |
+|---|---|
+| easy | existence, positional_existence |
+| medium | counting, size, relative_position, side_count_comparison |
+| hard | comparison, compositional |
+
+Example full training sequences (`<THINK>...</THINK> <FINAL>...</FINAL>`):
+
 ```
-Question: "are there more circles than squares?"
-Rationale: "count circles . found 2 . count squares . found 3 . compare 2 vs 3 . 2 is less ."
-Answer: "no"
+q: is there a red shape
+<THINK> red circle at row 2 col 5 . count is 1 </THINK> <FINAL> yes </FINAL>
+
+q: how many blue triangles are there
+<THINK> blue triangle at row 6 col 5 . count is 1 </THINK> <FINAL> 1 </FINAL>
+
+q: is a circle left of a red circle
+<THINK> red circle at row 3 col 5 . blue circle at row 5 col 2 . red circle
+at row 3 col 5 . col 2 is left of col 5 . found </THINK> <FINAL> yes </FINAL>
+
+q: are there more yellow shapes than yellow squares
+<THINK> yellow square at row 3 col 5 . count of yellow shapes is 1 . yellow
+square at row 3 col 5 . count of yellow squares is 1 . 1 equal to 1
+</THINK> <FINAL> no </FINAL>
 ```
 
-### 🎨 Multi-Shape Scenes
-- **RGB images** with 2-4 shapes per scene
-- **3 colors**: red, green, blue
-- **3 sizes**: small, medium, large
-- **5 shape types**: square, circle, rectangle, cross, triangle
-- **Metadata tracking**: shape type, color, size, position
+Every generated sample is independently re-verified by `validate_traces.py`:
+every enumerated object, every stated count, and every cited witness is
+checked against freshly recomputed ground truth, with zero tolerance for
+out-of-vocabulary tokens or sequences that overflow `MAX_SEQ_LEN`.
 
-### 📊 Spatial Vision Encoding
-- **8×8 spatial tokens** (64 tokens) instead of global pooling
-- **Learnable 2D positional embeddings**
-- Preserves spatial information for counting and localization
+## Training
 
-### 🎯 Auxiliary Heads
-- **Per-token**: shape classifier (6 classes), size classifier (3 classes)
-- **Global**: count predictors for each shape type (0-4)
-- Multi-task supervision helps disentangle visual features
+`train_model.py` implements the regime described in its own docstring:
 
-### 📚 Curriculum Learning
-**Epochs 0-2** (Easy): Existence, identification
-- Loss weights: rationale=2.0, answer=1.0, aux=0.5
+- **Mixed-difficulty curriculum**: every epoch samples all three
+  difficulties, with the mixture shifting toward harder questions over
+  training (`get_difficulty_mixture`) -- never an exclusive phase.
+- **Constant rationale/answer loss weights** (1.0 / 1.0); the auxiliary
+  count-head weight decays 0.3 -> 0.1 over training (`get_loss_weights`).
+- Optional **1-epoch perception warm-up** (aux loss only, disable with
+  `--no_perception_warmup`).
+- **`--no_cot`** ablation: trains with empty `<THINK>` spans (no rationale
+  supervision) to isolate the effect of chain-of-thought.
+- Full **seeding** (`random`/`numpy`/`torch`) for reproducibility.
+- **Per-epoch teacher-forced validation** on fixed, seeded validation sets
+  per difficulty (answer exact-match + rationale token accuracy).
+- **JSONL logging** (`train_log.jsonl` by default) and per-epoch
+  checkpoints in `checkpoints/`, plus a `checkpoints/best.pth` tracked by
+  validation answer EM.
 
-**Epochs 3-5** (Medium): Counting, color/size queries
-- Loss weights: rationale=1.0, answer=1.5, aux=0.3
+Default hyperparameters (`--epochs 20 --samples_per_epoch 100000
+--batch_size 128 --lr 5e-4`) target a single cloud GPU and run fine on a
+GCS or lambda.ai instance. On Apple Silicon (MPS), reduce scale, e.g.:
 
-**Epochs 6-9** (Hard): Comparison, multi-hop reasoning
-- Loss weights: rationale=0.5, answer=2.0, aux=0.2
-
-## Architecture Components
-
-### ToyVLM (Enhanced)
-- **SimpleVisionEncoder**: CNN → 8×8 spatial feature map → 64 tokens with positional embeddings
-- **Transformer decoder**: 6 layers, 4 heads (increased from 4 layers)
-- **Cross-attention**: Text attends to all 64 vision tokens
-- **AuxiliaryHeads**: Shape/size classifiers + count predictors
-
-### SimpleTokenizer (Extended)
-- **Vocabulary**: ~80 tokens including reasoning words
-- **Special tokens**: `<Q>`, `<REASON>`, `<SEP>`, `<FINAL>`
-- **Max sequence length**: 40 tokens (increased from 20)
-- **Format**: `<START> question <Q> <REASON> rationale <SEP> <FINAL> answer <END>`
-
-### RationaleGenerator
-Generates structured program traces for:
-- **Easy**: Existence, identification
-- **Medium**: Counting, color/size queries
-- **Hard**: Comparison, multi-hop reasoning
-
-## Model Configuration
-
-Current hyperparameters:
-- Image size: 64×64 pixels (RGB)
-- Hidden dimension: 256
-- Transformer: 6 layers, 4 attention heads
-- Vision tokens: 64 (8×8 grid)
-- Max sequence length: 40 tokens
-- Batch size: 32
-- Training epochs: 10
-- Learning rate: 2e-4 with StepLR decay
-
-## Installation
-
-### Recommended: use a project-local virtual environment (`.venv`)
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+.venv/bin/python train_model.py --samples_per_epoch 10000 --batch_size 64 --no_compile
 ```
 
-- Always activate the venv before running any scripts: `source .venv/bin/activate`.
-- On Apple Silicon, PyTorch will run on `mps` automatically; on NVIDIA GPUs, install a CUDA-enabled PyTorch per the official guide if needed (see the PyTorch install selector under "Get Started").
+Device selection, autocast/AMP, and dataloader settings are all handled
+automatically by `runtime.py` (CUDA -> MPS -> CPU).
 
-Alternative (not recommended): install globally
+## Usage
+
 ```bash
-pip install -r requirements.txt
+# Set up the environment
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Validate the data layer (no model, no torch-heavy work required)
+.venv/bin/python validate_traces.py --samples 1000
+
+# Fast end-to-end smoke test: can the model overfit 64 fixed samples?
+.venv/bin/python test_force.py --steps 500 --samples 64
+
+# Train
+.venv/bin/python train_model.py
+
+# Evaluate a trained checkpoint (per-question-type exact match + majority baselines)
+.venv/bin/python evaluate.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
+
+# Interactive GUI: generate scenes, ask questions, see rationale + answer
+.venv/bin/python test_model.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 ```
 
-## Running the Project
-
-### Training (with Curriculum Learning)
-```bash
-source .venv/bin/activate
-python train_model.py
-```
-- Trains for 10 epochs with curriculum learning (easy → medium → hard)
-- Saves model as `toy_vlm_cot.pth` and vocabulary as `tokenizer_vocab.json`
-- Displays per-epoch breakdown of rationale, answer, and auxiliary losses
-
-### Evaluation
-```bash
-source .venv/bin/activate
-python evaluate.py
-```
-- Evaluates on 100 samples per difficulty level
-- Reports exact-match accuracy
-- Shows example predictions with rationales
-
-### Interactive GUI
-```bash
-source .venv/bin/activate
-python test_model.py
-```
-Launches a Tkinter GUI for visual interaction with the trained model.
-
-### Device/runtime notes
-- Training auto-detects device via `runtime.py` (CUDA, MPS, or CPU) and configures AMP/autocast and dataloader settings accordingly. No extra flags are required for typical Mac (MPS) or NVIDIA GPU setups.
-
-#### GUI Features
-- **Question History**: Navigate previous questions using ↑/↓ arrow keys
-- **Auto-focus**: Question input box has focus by default for immediate typing
-- **Real-time Interaction**: Ask questions about generated shapes and get instant responses
-- **CoT Display**: See both rationale and final answer
-
-## Dependencies
-
-See `requirements.txt` for the complete list of dependencies:
-- **torch**: PyTorch with MPS support for Apple Silicon
-- **numpy**: Numerical computing
-- **tqdm**: Progress bars during training
-- **jinja2**: Question template rendering
-- **pillow**: Image processing and rotation
-- **tkinter**: GUI framework (usually included with Python)
-
-## Example Questions
-
-### Easy (Existence/Identification)
-- "is there a circle?"
-- "what shapes do you see?"
-
-### Medium (Counting/Attributes)
-- "how many circles are there?"
-- "how many red shapes are there?"
-- "are there any large shapes?"
-
-### Hard (Comparison/Multi-hop)
-- "are there more circles than squares?"
-- "are there more red shapes than blue shapes?"
-
-## Implementation Details
-
-### Loss Function
-```python
-total_loss = (weight_rationale * rationale_loss +
-              weight_answer * answer_loss +
-              weight_aux * aux_loss)
-```
-- **Rationale loss**: CE on tokens between `<REASON>` and `<SEP>`
-- **Answer loss**: CE on tokens between `<FINAL>` and `<END>`
-- **Auxiliary loss**: CE on count predictions for each shape type
-
-### Generation Process
-1. Encode question: `<START> question <Q> <REASON>`
-2. Generate rationale tokens until `<SEP>`
-3. Generate `<FINAL>` marker
-4. Generate answer tokens until `<END>`
-5. Parse and return (rationale, answer)
-
-## Future Enhancements
-- Spatial relation questions (left/right/above/below)
-- Per-token shape/size supervision with spatial ground truth
-- Attention visualization for reasoning steps
-- Temperature/top-k sampling strategies
-- Failure mode analysis
+Trained artifacts (`toy_vlm_cot.pth`, `tokenizer_vocab.json`,
+`checkpoints/`, `train_log.jsonl`) are gitignored -- train (or run
+`test_force.py`) before running `evaluate.py` or `test_model.py`.

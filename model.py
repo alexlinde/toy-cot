@@ -1,20 +1,30 @@
 """
 Model components for the Toy VLM.
 Contains all neural network architectures and model-related functionality.
+
+Layout (image-first, fixed positions):
+  [BOS] <IMG_START> <IMG>x64 <IMG_END> <|user|> q <|assistant|>
+  <THINK> rationale </THINK> <FINAL> answer </FINAL> <EOS>
+
+The image block occupies positions 1..PREFIX_LEN-1 in every sample, so the
+attention mask is prefix-LM: bidirectional within [0, PREFIX_LEN), causal after.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import math
-from text import MAX_SEQ_LEN, NUM_IMG_TOKENS
-from shapes import ObjType, ObjSize
+from text import MAX_SEQ_LEN, NUM_IMG_TOKENS, IMG_POS_START, PREFIX_LEN
+from shapes import ObjType, ObjSize, COLORS, MAX_OBJECTS
 
 # Model constants
 HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 6
+
+# Expensive per-forward assertions (force GPU syncs); enable with TOYCOT_DEBUG=1
+DEBUG_ASSERTS = os.environ.get("TOYCOT_DEBUG", "0") == "1"
 
 # Squeeze-and-Excitation (SE) module
 class SE(nn.Module):
@@ -32,17 +42,17 @@ class SE(nn.Module):
 class VisionTokenEncoder(nn.Module):
     """Tiny CNN -> 8x8 grid tokens -> linear to hidden_dim, with ALWAYS-ON (x,y) coord channels."""
 
-    def __init__(self, hidden_dim: int, channels: int = 64):
+    def __init__(self, hidden_dim: int, channels: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.channels = channels
 
-        # Input: (B, 1, 64, 64) - grayscale images; we'll concat (x,y) -> (B, 3, 64, 64)
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
-        self.pool1 = nn.AvgPool2d(2)  # -> (B, 16, 32, 32)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.AvgPool2d(2)  # -> (B, 32, 16, 16)
-        self.conv3 = nn.Conv2d(32, channels, kernel_size=3, padding=1, groups=4)
+        # Input: (B, 3, 64, 64) RGB; we concat (x,y) coords -> (B, 5, 64, 64)
+        self.conv1 = nn.Conv2d(5, 32, kernel_size=3, stride=1, padding=1)
+        self.pool1 = nn.AvgPool2d(2)  # -> (B, 32, 32, 32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool2 = nn.AvgPool2d(2)  # -> (B, 64, 16, 16)
+        self.conv3 = nn.Conv2d(64, channels, kernel_size=3, padding=1)
         self.pool3 = nn.AvgPool2d(2)  # -> (B, C, 8, 8)
 
         # Learnable 2D positional embeddings aligned to the 8x8 conv feature map
@@ -54,7 +64,7 @@ class VisionTokenEncoder(nn.Module):
         self.drop = nn.Dropout(p=0.1)
         self.ln = nn.LayerNorm(hidden_dim, eps=1e-5)
 
-        self.se3 = SE(channels)        
+        self.se3 = SE(channels)
 
     @staticmethod
     def _coord_channels(B: int, H: int, W: int, device, dtype):
@@ -66,14 +76,15 @@ class VisionTokenEncoder(nn.Module):
         return torch.cat([x, y], dim=1)
 
     def forward(self, x):
-        # x: (B, 1, 64, 64)
+        # x: (B, 3, 64, 64) RGB in [0,1]
         B, C, H, W = x.shape
-        assert C == 1, f"Expected grayscale input with 1 channel, got {C}"
-        assert H % 8 == 0 and W % 8 == 0, "Image size should be divisible by 8 for 8x8 grid downstream."
+        if DEBUG_ASSERTS:
+            assert C == 3, f"Expected RGB input with 3 channels, got {C}"
+            assert H % 8 == 0 and W % 8 == 0, "Image size should be divisible by 8 for 8x8 grid downstream."
 
         # ALWAYS add (x,y) coordinate channels
         coords = self._coord_channels(B, H, W, x.device, x.dtype)  # (B, 2, H, W)
-        x = torch.cat([x, coords], dim=1)  # (B, 3, H, W)
+        x = torch.cat([x, coords], dim=1)  # (B, 5, H, W)
 
         # Tiny CNN stem to 8x8 feature grid
         x = F.silu(self.conv1(x)); x = self.pool1(x)
@@ -83,44 +94,35 @@ class VisionTokenEncoder(nn.Module):
         # Add 2D positional encoding at the 8x8 stage
         x = x + self.pos_scale * self.pos_embed_2d
 
-        # Optional downsample to match NUM_IMG_TOKENS grid, then flatten to tokens
-        B, C, H, W = x.shape  # expected 8x8
-        if H * W != NUM_IMG_TOKENS:
-            G = int(math.sqrt(NUM_IMG_TOKENS))
-            assert G * G == NUM_IMG_TOKENS, f"NUM_IMG_TOKENS must be a perfect square, got {NUM_IMG_TOKENS}"
-            assert H % G == 0 and W % G == 0, f"Cannot pool from {H}x{W} to {G}x{G}"
-            k_h = H // G
-            k_w = W // G
-            x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))  # (B, C, G, G)
-            H, W = G, G
-
-        # Flatten to tokens -> (B, NUM_IMG_TOKENS, C)
+        # Flatten to tokens -> (B, NUM_IMG_TOKENS, C), raster order (row-major)
+        B, C, H, W = x.shape  # 8x8
         tokens = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
 
         # Project to hidden_dim and layer-norm
-        tokens = self.drop(self.proj(tokens)) # (B, N, hidden_dim))
+        tokens = self.drop(self.proj(tokens))  # (B, N, hidden_dim)
         tokens = self.ln(tokens)
-        
-        # NaN/Inf guard
-        assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
+
+        if DEBUG_ASSERTS:
+            assert tokens.size(1) == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} vision tokens, got {tokens.size(1)}"
+            assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
         return tokens
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention mechanism."""
-    
+
     def __init__(self, d_model, num_heads):
         super().__init__()
         assert d_model % num_heads == 0
-        
+
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        
+
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
-        
+
     def forward(self, query, key, value, mask=None):
         B = query.size(0)
         Q = self.W_q(query).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
@@ -129,9 +131,9 @@ class MultiHeadAttention(nn.Module):
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            # mask: (T,T) -> (B,h,T,T)
-            mask = mask.to(torch.bool)[None, None, :, :].expand(B, self.num_heads, -1, -1)
-            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            # mask: (T,T) bool, True = keep -> (B,h,T,T)
+            m = mask[None, None, :, :]
+            scores = scores.masked_fill(~m, torch.finfo(scores.dtype).min)
 
         attn = F.softmax(scores, dim=-1)
         context = torch.matmul(attn, V)
@@ -140,10 +142,12 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, attn_dropout=0.0, resid_dropout=0.1, layerscale_init=1e-2):
+    """Pre-LN transformer block (no LayerScale)."""
+
+    def __init__(self, d_model, num_heads, attn_dropout=0.0, resid_dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn  = MultiHeadAttention(d_model, num_heads)
+        self.attn = MultiHeadAttention(d_model, num_heads)
         self.attn_drop = nn.Dropout(attn_dropout)
 
         self.norm2 = nn.LayerNorm(d_model)
@@ -154,18 +158,10 @@ class TransformerBlock(nn.Module):
         )
         self.resid_drop = nn.Dropout(resid_dropout)
 
-        # LayerScale (per-dim learnable residual scales)
-        self.ls1 = nn.Parameter(torch.ones(d_model) * layerscale_init)
-        self.ls2 = nn.Parameter(torch.ones(d_model) * layerscale_init)
-
     def forward(self, x, mask=None):
-        a = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), mask)
-        a = self.attn_drop(a)
-        x = x + self.ls1 * a
-
-        f = self.ffn(self.norm2(x))
-        f = self.resid_drop(f)
-        x = x + self.ls2 * f
+        h = self.norm1(x)
+        x = x + self.attn_drop(self.attn(h, h, h, mask))
+        x = x + self.resid_drop(self.ffn(self.norm2(x)))
         return x
 
 
@@ -189,15 +185,19 @@ class TokenPool(nn.Module):
         return pooled
 
 class AuxiliaryHeads(nn.Module):
-    def __init__(self, hidden_dim: int, max_count: int = 5):
+    """Count heads over pooled vision tokens: per-shape, per-size, and per-color counts.
+
+    Counts range 0..MAX_OBJECTS, so each head has MAX_OBJECTS + 1 classes.
+    """
+
+    def __init__(self, hidden_dim: int, num_classes: int = MAX_OBJECTS + 1):
         super().__init__()
-        self.num_classes = max_count
-        self.num_shapes = len(ObjType)
-        self.num_sizes = len(ObjSize)
+        self.num_classes = num_classes
+        self.shape_names = [obj.value for obj in ObjType]
+        self.size_names = [size.value for size in ObjSize]
+        self.color_names = sorted(COLORS.keys())
 
-        # NEW: attention pooling
         self.token_pool = TokenPool(hidden_dim)
-
         self.pool_norm = nn.LayerNorm(hidden_dim)
         self.pool_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -205,32 +205,40 @@ class AuxiliaryHeads(nn.Module):
         )
 
         self.shape_count_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, self.num_classes) for _ in range(self.num_shapes)
+            nn.Linear(hidden_dim, self.num_classes) for _ in self.shape_names
         ])
         self.size_count_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, self.num_classes) for _ in range(self.num_sizes)
+            nn.Linear(hidden_dim, self.num_classes) for _ in self.size_names
+        ])
+        self.color_count_heads = nn.ModuleList([
+            nn.Linear(hidden_dim, self.num_classes) for _ in self.color_names
         ])
 
     def forward(self, vision_tokens: torch.Tensor):
         # vision_tokens: [B, N, H]
-        pooled = self.token_pool(vision_tokens)  # <-- was mean(dim=1)
+        pooled = self.token_pool(vision_tokens)
         pooled = self.pool_norm(pooled)
         pooled = self.pool_proj(pooled)
 
-        count_logits = {}
-        for idx, obj in enumerate(ObjType):
-            count_logits[obj.value] = self.shape_count_heads[idx](pooled)
+        count_logits = {
+            name: head(pooled) for name, head in zip(self.shape_names, self.shape_count_heads)
+        }
+        size_count_logits = {
+            name: head(pooled) for name, head in zip(self.size_names, self.size_count_heads)
+        }
+        color_count_logits = {
+            name: head(pooled) for name, head in zip(self.color_names, self.color_count_heads)
+        }
 
-        size_count_logits = {}
-        for idx, size in enumerate(ObjSize):
-            size_count_logits[size.value] = self.size_count_heads[idx](pooled)
-
-        return {'count_logits': count_logits, 'size_count_logits': size_count_logits}
-
+        return {
+            'count_logits': count_logits,
+            'size_count_logits': size_count_logits,
+            'color_count_logits': color_count_logits,
+        }
 
 
 class ToyVLM(nn.Module):
-    """Vision-Language Model that prefixes image tokens into the text sequence."""
+    """Vision-Language Model with an image-first token prefix and prefix-LM attention."""
 
     def __init__(self, text_processor):
         super().__init__()
@@ -254,7 +262,14 @@ class ToyVLM(nn.Module):
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(HIDDEN_DIM, NUM_HEADS) for _ in range(NUM_LAYERS)
         ])
+        self.final_norm = nn.LayerNorm(HIDDEN_DIM)
         self.dropout = nn.Dropout(0.1)
+
+        # Prefix-LM mask: bidirectional within the fixed image prefix, causal after.
+        causal = ~torch.triu(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool), diagonal=1)
+        prefix = torch.zeros(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool)
+        prefix[:PREFIX_LEN, :PREFIX_LEN] = True
+        self.register_buffer("attn_mask", causal | prefix, persistent=False)
 
         # Xavier initialization for linear and conv layers
         def _init_weights(m):
@@ -269,55 +284,50 @@ class ToyVLM(nn.Module):
 
         # init *before* tying
         self.apply(_init_weights)  # only touches Linear/Conv, not Embedding
+        # GPT-style small embedding init: the default N(0,1) blows up the tied
+        # output head's logits (~100 CE at init instead of ~ln(vocab))
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         # now tie (so Embedding keeps its intended init)
         self.output_projection.weight = self.token_embedding.weight
         if self.output_projection.bias is not None:
-            nn.init.zeros_(self.output_projection.bias)  # common practice
-
-    def create_causal_mask(self, seq_len, device):
-        base = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-        # allowed = lower-tri including diag
-        return ~base  # True = keep, False = mask
+            nn.init.zeros_(self.output_projection.bias)
 
     def encode_image_tokens(self, images):
         """Encode image into exactly NUM_IMG_TOKENS visual tokens [B, N, H]."""
         return self.vision_token_encoder(images)
 
     def forward_with_embeds(self, input_embeds):
-        batch_size, seq_len, _ = input_embeds.shape
-        device = input_embeds.device
-        mask = self.create_causal_mask(seq_len, device)
+        seq_len = input_embeds.size(1)
+        mask = self.attn_mask[:seq_len, :seq_len]
         hidden = input_embeds
         for block in self.transformer_blocks:
             hidden = block(hidden, mask)
-        return self.output_projection(hidden)
+        return self.output_projection(self.final_norm(hidden))
 
     def forward(self, images, input_tokens, return_aux=False):
         batch_size, seq_len = input_tokens.shape
         device = input_tokens.device
+        tok = self.text_processor.tokenizer
+        s, n = IMG_POS_START, NUM_IMG_TOKENS
 
         # 1) Encode image into a fixed set of tokens
-        img_tokens = self.encode_image_tokens(images)  # [B, 64, H] for 8x8 grid
+        img_tokens = self.encode_image_tokens(images)  # [B, 64, H]
 
         # 2) Embed input token IDs
         token_embeds = self.token_embedding(input_tokens)  # [B, T, H]
 
-        # 3) Replace <IMG> placeholder embeddings with visual tokens in order
-        tok = self.text_processor.tokenizer
-        # Prepare per-token type embeddings: default to text_type, override image positions with vision_type
-        type_add = self.text_type.expand(batch_size, seq_len, -1).clone()
-        for b in range(batch_size):
-            img_positions = (input_tokens[b] == tok.img_token_id).nonzero(as_tuple=True)[0]
-            n = img_positions.numel()
-            assert n == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} image tokens, got {n}"
-            btok = img_tokens[b:b+1]  # [1, NUM_IMG_TOKENS, H]
-            token_embeds[b, img_positions, :] = btok[0]
-            # Set type embedding for image tokens to vision_type (do not also add text_type)
-            type_add[b, img_positions, :] = self.vision_type
+        # 3) Splice visual tokens into the fixed image-block positions
+        if DEBUG_ASSERTS:
+            assert seq_len >= s + n, f"sequence too short for image block: {seq_len}"
+            assert (input_tokens[:, s:s + n] == tok.img_token_id).all(), \
+                "[model] <IMG> placeholders not at fixed positions - layout mismatch"
+        token_embeds[:, s:s + n, :] = img_tokens
 
-        # Basic structure checks
-        assert torch.isfinite(token_embeds).all(), "[model] NaN/Inf in token_embeds"
+        # Type embeddings: text everywhere, vision on the image block
+        type_add = self.text_type.expand(batch_size, seq_len, -1).clone()
+        type_add[:, s:s + n, :] = self.vision_type
 
         # 4) Add positional and type embeddings
         positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -325,9 +335,11 @@ class ToyVLM(nn.Module):
         input_embeds = self.input_norm(input_embeds)
         input_embeds = self.dropout(input_embeds)
 
-        # 5) Decode with self-attention only
+        # 5) Decode with prefix-LM self-attention
         logits = self.forward_with_embeds(input_embeds)
-        assert torch.isfinite(logits).all(), "[model] NaN/Inf in logits"
+        if DEBUG_ASSERTS:
+            assert torch.isfinite(logits).all(), "[model] NaN/Inf in logits"
+
         aux_outputs = None
         if return_aux:
             # Provide auxiliary heads with the unmodified visual tokens
@@ -335,27 +347,17 @@ class ToyVLM(nn.Module):
 
         return logits if not return_aux else (logits, aux_outputs)
 
-def _find_first(seq, token_id):
-    for i,t in enumerate(seq):
-        if t == token_id: return i
-    return None
-
-def _sample_logits(logits, temperature=0.7):
-    """Sample from logits with temperature."""
-    probs = F.softmax(logits / temperature, dim=-1)
-    return torch.multinomial(probs, 1).item()
 
 @torch.no_grad()
-def generate_response(model, image, question, max_length=35, return_rationale=True):
-    """Generate response with optional chain-of-thought rationale using new prompt.
+def generate_response(model, image, question, max_length=80, return_rationale=True):
+    """Two-stage greedy decoding with special tokens banned from free generation.
 
-    New format:
-      [BOS] [|user|] q + <IMG_START> <IMG>xN <IMG_END> [|assistant|] <THINK>
-      rationale </THINK> <FINAL> answer </FINAL> <EOS>
+    Prompt: [BOS] <IMG_START> <IMG>xN <IMG_END> <|user|> q <|assistant|> <THINK>
+    Stage 1 generates the rationale until </THINK>; stage 2 the answer until </FINAL>.
 
     Args:
         model: ToyVLM instance
-        image: Input image tensor (C, H, W) in [0,1] or [0,255]
+        image: RGB tensor (3, 64, 64), float32 in [0,1]
         question: Question string
         max_length: Maximum steps per stage (rationale/answer)
         return_rationale: If True returns (rationale, answer); else answer
@@ -364,79 +366,66 @@ def generate_response(model, image, question, max_length=35, return_rationale=Tr
     device = next(model.parameters()).device
     tok = model.text_processor.tokenizer
 
-    # Image must already be the correct format: (1, 64, 64), float in [0,1]
     assert isinstance(image, torch.Tensor), "image must be a torch.Tensor"
-    assert image.ndim == 3 and image.size(0) == 1 and image.size(1) == 64 and image.size(2) == 64, \
-        f"expected image shape (1,64,64), got {tuple(image.shape)}"
+    assert image.ndim == 3 and image.shape == (3, 64, 64), \
+        f"expected image shape (3,64,64), got {tuple(image.shape)}"
     assert image.dtype == torch.float32, f"expected image dtype float32, got {image.dtype}"
-    imin = float(image.min())
-    imax = float(image.max())
+    imin, imax = float(image.min()), float(image.max())
     assert 0.0 <= imin and imax <= 1.0, f"expected image normalized to [0,1], got range [{imin:.3f}, {imax:.3f}]"
     image = image.to(device)
 
-    # Build prompt tokens
-    # Use allow_unk=True for free-form questions
+    # Build prompt tokens (allow_unk for free-form questions)
     q_ids = tok.tokenize(question, allow_unk=True)
-    num_img_tokens = NUM_IMG_TOKENS
-    img_block = [tok.img_start_id] + [tok.img_token_id] * num_img_tokens + [tok.img_end_id]
-    input_ids = [tok.bos_token_id] + [tok.user_token_id] + q_ids + img_block + [tok.assistant_token_id] + [tok.think_start_id]
+    img_block = [tok.img_start_id] + [tok.img_token_id] * NUM_IMG_TOKENS + [tok.img_end_id]
+    input_ids = ([tok.bos_token_id] + img_block + [tok.user_token_id] + q_ids +
+                 [tok.assistant_token_id] + [tok.think_start_id])
+
+    all_special_ids = {
+        tok.pad_token_id, tok.bos_token_id, tok.eos_token_id, tok.unk_token_id,
+        tok.user_token_id, tok.assistant_token_id,
+        tok.think_start_id, tok.think_end_id, tok.final_start_id, tok.final_end_id,
+        tok.img_start_id, tok.img_end_id, tok.img_token_id,
+    }
+
+    def step_once(ids, allowed_special):
+        """Greedy next token with every special token banned except allowed_special."""
+        ids_pad = model.text_processor.pad_sequence(ids, MAX_SEQ_LEN)
+        ids_t = torch.tensor(ids_pad, dtype=torch.long, device=device).unsqueeze(0)
+        logits = model(image.unsqueeze(0), ids_t)
+        pos = min(len(ids) - 1, MAX_SEQ_LEN - 1)
+        next_logits = logits[0, pos, :].clone()
+        banned = [tid for tid in all_special_ids if tid != allowed_special]
+        next_logits[banned] = float('-inf')
+        return int(torch.argmax(next_logits).item())
 
     rationale_tokens = []
     answer_tokens = []
 
-    def step_once(ids, allowed=None, end_id=None, prefer_after=None):
-        # Pad sequence and run forward to get next-token logits at last position
-        ids_pad = model.text_processor.pad_sequence(ids, MAX_SEQ_LEN)
-        ids_t = torch.tensor(ids_pad, dtype=torch.long, device=device).unsqueeze(0)
-        img_t = image.unsqueeze(0)
-        logits = model(img_t, ids_t)
-        # Use the last real token position (before padding) for next-token logits
-        pos = min(len(ids) - 1, MAX_SEQ_LEN - 1)
-        next_logits = logits[0, pos, :].clone()
-        if allowed:
-            idx = torch.tensor(allowed, device=next_logits.device, dtype=torch.long)
-            sub = next_logits[idx]
-            # Encourage ending token after minimal content
-            if end_id is not None and prefer_after is not None and (len(ids) >= prefer_after):
-                for j, tid in enumerate(allowed):
-                    if tid == end_id:
-                        sub[j] = sub[j] + 1.0
-            choice = int(idx[int(torch.argmax(sub)).item()].item())
-            return choice
-        return int(torch.argmax(next_logits).item())
-
-    # Rationale stage: generate until </THINK> or limit
+    # Stage 1: rationale until </THINK>
     for _ in range(max_length):
-        nxt = step_once(input_ids, allowed=None, end_id=tok.think_end_id, prefer_after=2)
-        if nxt in (tok.eos_token_id, tok.pad_token_id):
-            break
+        if len(input_ids) >= MAX_SEQ_LEN - 4:
+            break  # leave room for </THINK> <FINAL> answer </FINAL>
+        nxt = step_once(input_ids, allowed_special=tok.think_end_id)
         input_ids.append(nxt)
         if nxt == tok.think_end_id:
             break
         rationale_tokens.append(nxt)
-    # Ensure THINK is closed
-    if not (len(input_ids) and input_ids[-1] == tok.think_end_id):
+    if input_ids[-1] != tok.think_end_id:
         input_ids.append(tok.think_end_id)
 
-    # Append <FINAL>
     input_ids.append(tok.final_start_id)
 
-    # Answer stage: generate until </FINAL> or single yes/no token
+    # Stage 2: answer until </FINAL>
     for _ in range(max_length):
-        nxt = step_once(input_ids, allowed=None, end_id=tok.final_end_id, prefer_after=1)
-        if nxt in (tok.eos_token_id, tok.pad_token_id):
+        if len(input_ids) >= MAX_SEQ_LEN - 1:
             break
+        nxt = step_once(input_ids, allowed_special=tok.final_end_id)
+        input_ids.append(nxt)
         if nxt == tok.final_end_id:
-            input_ids.append(nxt)
             break
         answer_tokens.append(nxt)
-        input_ids.append(nxt)
-
-    # Ensure closing </FINAL> and <EOS>
-    if not (len(input_ids) and input_ids[-1] == tok.final_end_id):
+    if input_ids[-1] != tok.final_end_id:
         input_ids.append(tok.final_end_id)
-    if not (len(input_ids) and input_ids[-1] == tok.eos_token_id):
-        input_ids.append(tok.eos_token_id)
 
     rationale = tok.decode(rationale_tokens, skip_special_tokens=True)
     answer = tok.decode(answer_tokens, skip_special_tokens=True)

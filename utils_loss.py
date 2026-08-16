@@ -21,7 +21,6 @@ def compute_weighted_loss(
         logits.reshape(-1, V),
         target_tokens.reshape(-1),
         ignore_index=tokenizer.pad_token_id,
-        label_smoothing=0.1,
         reduction='none'
     ).view(target_tokens.size(0), -1)
 
@@ -35,17 +34,17 @@ def compute_weighted_loss(
     aux_loss = torch.tensor(0.0, device=logits.device)
     num_heads = 0
     if aux_outputs is not None:
-        # Shape count losses
-        if 'count_logits' in aux_outputs:
-            for shape, head_logits in aux_outputs['count_logits'].items():
-                targets = torch.tensor([al['counts'][shape] for al in aux_labels],
-                                       device=head_logits.device, dtype=torch.long)
-                aux_loss = aux_loss + F.cross_entropy(head_logits, targets)
-                num_heads += 1
-        # Size count losses
-        if 'size_count_logits' in aux_outputs:
-            for size, head_logits in aux_outputs['size_count_logits'].items():
-                targets = torch.tensor([al['size_counts'][size] for al in aux_labels],
+        # (aux_outputs key, aux_labels key) pairs for each count-head family
+        head_families = [
+            ('count_logits', 'counts'),
+            ('size_count_logits', 'size_counts'),
+            ('color_count_logits', 'color_counts'),
+        ]
+        for out_key, label_key in head_families:
+            if out_key not in aux_outputs:
+                continue
+            for name, head_logits in aux_outputs[out_key].items():
+                targets = torch.tensor([al[label_key][name] for al in aux_labels],
                                        device=head_logits.device, dtype=torch.long)
                 aux_loss = aux_loss + F.cross_entropy(head_logits, targets)
                 num_heads += 1
@@ -57,5 +56,3 @@ def compute_weighted_loss(
              loss_weights['aux']       * aux_loss)
 
     return total, rationale_loss, answer_loss, aux_loss
-
-

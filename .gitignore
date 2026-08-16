@@ -57,6 +57,7 @@ datasets/
 
 # Logs
 *.log
+*.jsonl
 logs/
 
 # Jupyter Notebook
