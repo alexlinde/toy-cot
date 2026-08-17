@@ -65,8 +65,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from model import ToyVLM
-from questions import (CORRECTION_MARKER, RationaleGenerator, STEP_SEP,
-                       WORD_BUDGET, join_steps, split_steps)
+from questions import (CORRECTION_MARKER, DIFFICULTY_MAP, RationaleGenerator,
+                       STEP_SEP, WORD_BUDGET, join_steps, split_steps)
 from shapes import MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator
 from text import MAX_SEQ_LEN, NUM_IMG_TOKENS, TextProcessor
 from train_model import DIFFICULTIES
@@ -295,27 +295,45 @@ def build_correction(gold_rationale: str, model_rationale: str,
 
 
 def _draw_sample(shape_gen: ShapeGenerator, rationale_gen: RationaleGenerator,
-                 difficulties: Sequence[str]):
-    """One scene + gold QA triple, redrawn until a generator commits."""
+                 difficulties: Sequence[str], hard_frac: float = 0.0,
+                 hard_types: Sequence[str] = ()):
+    """One scene + gold QA triple (with its question type), redrawn until a
+    generator commits.
+
+    With probability `hard_frac` the type is drawn uniformly from `hard_types`
+    -- the failure-focused collection the STaR/DAgger arms share with grpo.py's
+    prompt mix; otherwise a difficulty is drawn as before and a type uniformly
+    within it. Either way the concrete type is drawn here (not inside
+    generate_qa_with_rationale), so every sample carries the label the
+    per-type stats aggregate by.
+    """
     while True:
         num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
         image, metadata = shape_gen.generate_multi_shape_image(num_shapes, True)
-        difficulty = random.choice(list(difficulties))
-        question, answer, rationale = rationale_gen.generate_qa_with_rationale(
-            metadata, difficulty=difficulty)
+        if hard_types and random.random() < hard_frac:
+            qtype = random.choice(list(hard_types))
+        else:
+            difficulty = random.choice(list(difficulties))
+            qtype = random.choice(DIFFICULTY_MAP[difficulty])
+        question, answer, rationale = rationale_gen.generators[qtype](metadata)
         if question is not None and answer is not None and rationale:
-            return image, metadata, question, answer, rationale, difficulty
+            return image, metadata, question, answer, rationale, qtype
 
 
 def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: int,
             out_path: str, temperature_mix: Sequence[float] = (0.0, 0.7),
             seed: int = 0, max_gen_len: int = MAX_GEN_LEN,
-            num_examples: int = 3, star: bool = False) -> Dict[str, Any]:
+            num_examples: int = 3, star: bool = False,
+            hard_frac: float = 0.0, hard_types: Sequence[str] = ()) -> Dict[str, Any]:
     """Sample chains, splice corrections, and save the padded training tensors.
 
     `star`: when True, keep only STAR_KEEP_KINDS dispositions ('exact' and
     'early_stop') in the saved tensors, discarding 'corrected' samples -- the
     STaR / rejection-sampling variant (see module docstring).
+
+    `hard_frac` / `hard_types`: failure-focused collection (see _draw_sample).
+    Per-type disposition and answer-EM stats are always recorded; under --star
+    a type's 'exact' fraction is its pass@1 at the collection temperature.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -333,6 +351,8 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
     kinds_out: List[int] = []
 
     counts = {k: 0 for k in KINDS}
+    # qtype -> {'n': int, 'answer_hits': int, <kind>: int, ...}
+    by_type: Dict[str, Dict[str, int]] = {}
     error_indices: List[int] = []
     answer_hits = 0
     examples: List[Dict[str, Any]] = []
@@ -343,7 +363,9 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
         take = min(batch_size, n_samples - bi * batch_size)
         temperature = float(temperature_mix[bi % len(temperature_mix)])
 
-        drawn = [_draw_sample(shape_gen, rationale_gen, DIFFICULTIES) for _ in range(take)]
+        drawn = [_draw_sample(shape_gen, rationale_gen, DIFFICULTIES,
+                              hard_frac=hard_frac, hard_types=hard_types)
+                 for _ in range(take)]
         raw_images = np.stack([d[0] for d in drawn])                    # (B,H,W,3) uint8
         img_u8 = torch.from_numpy(raw_images).permute(0, 3, 1, 2).contiguous()
         images = img_u8.to(torch.float32) / 255.0
@@ -353,15 +375,21 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
                                          temperature=temperature,
                                          max_length=max_gen_len)
 
-        for b, (_, _, question, answer, gold_rationale, difficulty) in enumerate(drawn):
+        for b, (_, _, question, answer, gold_rationale, qtype) in enumerate(drawn):
             rat_ids, ans_ids = chains[b]
             model_rationale = tok.decode(rat_ids, skip_special_tokens=True)
             model_answer = tok.decode(ans_ids, skip_special_tokens=True)
-            answer_hits += int(model_answer.strip() == answer.strip())
+            hit = int(model_answer.strip() == answer.strip())
+            answer_hits += hit
 
             reserved = len(question.split()) + len(answer.split())
             kind, spec, index = build_correction(gold_rationale, model_rationale, reserved)
             counts[kind] += 1
+            trow = by_type.setdefault(qtype, {'n': 0, 'answer_hits': 0,
+                                              **{k: 0 for k in KINDS}})
+            trow['n'] += 1
+            trow['answer_hits'] += hit
+            trow[kind] += 1
             if kind == 'corrected':
                 error_indices.append(index)
 
@@ -379,7 +407,7 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
 
             if kind == 'corrected' and len(examples) < num_examples:
                 examples.append({
-                    'difficulty': difficulty,
+                    'qtype': qtype,
                     'question': question,
                     'answer': answer,
                     'temperature': temperature,
@@ -402,6 +430,9 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
         'mean_first_error_step': (sum(error_indices) / len(error_indices))
                                  if error_indices else None,
         'free_running_answer_em': answer_hits / max(1, n_samples),
+        'hard_frac': hard_frac,
+        'hard_types': list(hard_types),
+        'by_type': {t: dict(row) for t, row in sorted(by_type.items())},
         'temperature_mix': list(temperature_mix),
         'seed': seed,
         'batch_size': batch_size,
@@ -467,6 +498,19 @@ def print_report(result: Dict[str, Any]) -> None:
           else "  mean first-error step index: n/a")
     print(f"  free-running answer EM: {stats['free_running_answer_em']:.3f}")
 
+    by_type = stats.get('by_type', {})
+    if len(by_type) > 1:
+        # 'exact' fraction per type is that type's pass@1 at the collection
+        # temperature -- the number that decides whether rejection sampling
+        # has anything to keep on the questions the model usually misses.
+        print(f"  {'type':<20} {'n':>6} {'ans EM':>7} {'exact':>7} "
+              f"{'early':>7} {'corr':>7}")
+        for t, row in by_type.items():
+            n = max(1, row['n'])
+            print(f"  {t:<20} {row['n']:>6} {row['answer_hits'] / n:>7.3f} "
+                  f"{row['exact'] / n:>7.3f} {row['early_stop'] / n:>7.3f} "
+                  f"{row['corrected'] / n:>7.3f}")
+
     star = stats.get('star', {})
     if star.get('enabled'):
         total = star['kept'] + star['discarded']
@@ -476,7 +520,7 @@ def print_report(result: Dict[str, Any]) -> None:
               f"{star['discarded_by_kind']}")
 
     for i, ex in enumerate(result['examples']):
-        print(f"\n--- corrected example {i + 1} ({ex['difficulty']}, T={ex['temperature']}) ---")
+        print(f"\n--- corrected example {i + 1} ({ex['qtype']}, T={ex['temperature']}) ---")
         print(f"  Q: {ex['question']}   gold A: {ex['answer']}   model A: {ex['model_answer']}")
         print(f"  gold : {ex['gold_rationale']}")
         print(f"  model: {ex['model_rationale']}")
@@ -532,7 +576,20 @@ def main():
                         help="STaR / rejection-sampling: keep only fully "
                              "gold-supervised samples (exact + early_stop) in "
                              "the saved tensors, discarding corrected traces")
+    parser.add_argument("--hard_frac", type=float, default=0.0,
+                        help="probability a draw comes from --hard_types "
+                             "instead of the difficulty mixture (0 = off; "
+                             "0.8 matches grpo.py's prompt mix)")
+    parser.add_argument("--hard_types", type=str, nargs='+',
+                        default=['ordinal', 'compositional_h3',
+                                 'compositional_h4', 'relative_count'],
+                        help="failure-focused question types for --hard_frac")
     args = parser.parse_args()
+
+    rg_types = RationaleGenerator().generators
+    unknown = [t for t in args.hard_types if t not in rg_types]
+    assert not unknown, (
+        f"[onpolicy] unknown --hard_types {unknown}; have {sorted(rg_types)}")
 
     device = best_device()
     print(f"Loading {args.checkpoint} on {device}")
@@ -541,7 +598,8 @@ def main():
     result = collect(model, text_processor, n_samples=args.n, batch_size=args.batch_size,
                      out_path=args.out, temperature_mix=tuple(args.temperatures),
                      seed=args.seed, max_gen_len=args.max_gen_len,
-                     num_examples=args.examples, star=args.star)
+                     num_examples=args.examples, star=args.star,
+                     hard_frac=args.hard_frac, hard_types=args.hard_types)
     print_report(result)
 
     if args.stats_json:
