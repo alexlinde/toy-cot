@@ -3,8 +3,11 @@
 
 For every question type it draws fresh scenes, generates the question / answer /
 rationale, and then *independently* re-derives the ground truth from the
-quantized grid coordinates. Every fact stated in a rationale is re-parsed and
-checked:
+quantized grid coordinates. The question is parsed by a grammar written here
+(Q_PATTERNS), which accepts every surface form the generator asks a type in --
+'is a circle above a red square' and 'is there a circle above a red square' are
+one question, and a phrasing the grammar cannot parse is a failure, not a
+sample to skip. Every fact stated in a rationale is re-parsed and checked:
 
 * each enumerated ``{color} {shape} at row r col c`` names a real object that
   really sits in that quantized cell, and the enumeration is complete and in
@@ -257,27 +260,65 @@ ORD = '|'.join(ORDINAL_WORDS)
 
 
 def chain_question_pattern(hops: int) -> 're.Pattern':
-    """'is a D1 r1 the D2 that is r2 the D3 ...' with `hops` relations."""
-    pattern = rf"is a ({DESC}) ({REL}) the ({DESC})"
+    """'is a D1 r1 the D2 that is r2 the D3 ...' with `hops` relations.
+
+    The head clause is accepted in both of its surface forms ('is a ...' and
+    'is there a ...'); only the words before the first descriptor differ, so the
+    captures are descriptor, relation, descriptor, ... either way.
+    """
+    pattern = rf"(?:is a|is there a) ({DESC}) ({REL}) the ({DESC})"
     pattern += rf" that is ({REL}) the ({DESC})" * (hops - 1)
     return re.compile(pattern + "$")
 
 
+# One anchored pattern per question type, written here by hand rather than
+# imported from questions.py: a grammar that shared the generator's templates
+# could not disagree with them.
+#
+# Each type is asked in several surface forms, spelled as non-capturing
+# alternations over the words that vary (the shape the positional_existence
+# pattern has always had). Every variant of a type therefore captures the same
+# things in the same order -- the checkers below index the groups positionally,
+# and an alternation that moved a descriptor from group 1 to group 2 would
+# silently hand a checker the wrong string.
+#
+# The alternations are deliberately permissive about which prefix pairs with
+# which optional tail: 'are there any circle on the left' has always parsed as
+# positional_existence, and 'how many circles' now parses whether or not the
+# 'are there' tail follows. Pinning down which of the generator's surface forms
+# produced a question is not the grammar's job -- extracting the descriptors,
+# relations and sides the question is *about* is, and every branch here does
+# that unambiguously.
 Q_PATTERNS = {
-    'existence': re.compile(rf"is there a ({DESC})$"),
+    'existence': re.compile(rf"(?:is there a|are there any|are there) ({DESC})$"),
     'positional_existence': re.compile(
-        rf"(?:is there a|are there any) ({DESC}) on the ({SIDE})$"),
-    'counting': re.compile(rf"how many ({DESC}) are there$"),
-    'size': re.compile(rf"are there any ({SIZE}) shapes$"),
-    'relative_position': re.compile(rf"is a ({DESC}) ({REL}) a ({DESC})$"),
-    'side_count_comparison': re.compile(rf"are there more ({DESC}) on the ({SIDE})$"),
-    'parity': re.compile(rf"are there an even number of ({DESC})$"),
-    'comparison': re.compile(rf"are there more ({DESC}) than ({DESC})$"),
+        rf"(?:is there a|are there any|are there) ({DESC}) on the ({SIDE})$"),
+    'counting': re.compile(
+        rf"(?:how many|what is the (?:number|count) of) ({DESC})"
+        rf"(?: are there)?$"),
+    'size': re.compile(rf"(?:are there any|are there|is there a) ({SIZE}) shapes?$"),
+    'relative_position': re.compile(
+        rf"(?:is a|is there a|are there any) ({DESC}) ({REL}) a ({DESC})$"),
+    # The third group is the explicitly named opposite side of the long form
+    # ('... on the left than on the right'), and None in the short one; the
+    # checker rejects any side other than the opposite of group 2.
+    'side_count_comparison': re.compile(
+        rf"are there more ({DESC}) on the ({SIDE})(?: than on the ({SIDE}))?$"),
+    'parity': re.compile(
+        rf"(?:are there an even number of|is the (?:number|count) of) ({DESC})"
+        rf"(?: even)?$"),
+    'comparison': re.compile(
+        rf"(?:are there more|is the (?:number|count) of) ({DESC}) "
+        rf"(?:than|greater than the (?:number|count) of) ({DESC})$"),
     'count_difference': re.compile(
-        rf"what is the difference between the number of ({DESC}) and "
-        rf"the number of ({DESC})$"),
-    'ordinal': re.compile(rf"what shape is ({ORD}) from the ({SIDE})$"),
-    'relative_count': re.compile(rf"how many ({DESC}) are ({REL}) the ({DESC})$"),
+        rf"what is the difference between the (?:number|count) of ({DESC}) and "
+        rf"the (?:number|count) of ({DESC})$"),
+    'ordinal': re.compile(
+        rf"(?:(?:what|which) shape is|what is the) ({ORD})(?: shape)? "
+        rf"from the ({SIDE})$"),
+    'relative_count': re.compile(
+        rf"(?:how many|what is the (?:number|count) of) ({DESC})"
+        rf"(?: are)?(?: there)? ({REL}) the ({DESC})$"),
 }
 Q_PATTERNS.update({f'compositional_h{h}': chain_question_pattern(h)
                    for h in CHAIN_DEPTHS})
@@ -616,6 +657,13 @@ def check_side_count_comparison(q, a, r, meta):
     m = parse_question('side_count_comparison', q)
     desc, side = parse_desc(m.group(1)), m.group(2)
     other = OPPOSITE[side]
+    # The long surface form names the compared side out loud. It has to be the
+    # opposite one: the trace counts `side` against `other` and nothing else, so
+    # a question naming any other side would be answered by a trace about a
+    # different comparison.
+    if m.group(3) is not None and m.group(3) != other:
+        raise SampleError(f"question compares the {side} with the {m.group(3)}, "
+                          f"but the trace counts the {side} against the {other}")
     objs = select(meta, desc)
     here = sum(1 for o in objs if side_holds(o, side))
     there = sum(1 for o in objs if side_holds(o, other))

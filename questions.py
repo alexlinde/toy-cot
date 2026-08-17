@@ -27,6 +27,11 @@ Trace conventions
 
 All spatial ground truth is computed from the quantized grid coordinates
 (shapes.grid_row / shapes.grid_col), never from raw pixel centers.
+
+Every question type is asked in two to four surface forms (see `phrase`). The
+phrasing is drawn after the answer and the rationale are computed and never
+changes either of them, so the variants train the model to read a question
+rather than to pattern-match a template.
 """
 
 import random
@@ -82,7 +87,11 @@ TEMPLATE_WORDS = frozenset({
     # here even if the question template that first needed it changes.
     'is', 'a', 'an', 'there', 'any', 'are', 'on', 'the', 'how', 'many', 'than',
     'more', 'that', 'what', 'number', 'difference', 'between', 'and', 'from',
-    # trace steps
+    # trace steps. Several of these are question words as well now that each
+    # type is asked in more than one way ('is the count of circles even',
+    # 'is the number of circles greater than the number of squares'); the
+    # surface variants were chosen to reuse exactly these words, so the
+    # tokenizer's vocabulary is unchanged by them.
     'at', 'row', 'col', 'count', 'of', 'no', 'none', 'found', 'qualifying',
     'greater', 'less', 'equal', 'to', 'even', 'odd',
     # answers
@@ -144,6 +153,44 @@ RELATIVE_COUNT_TARGET_MAX = 5
 # object on one side of the referent.
 RELATIVE_COUNT_BROAD_PROB = 0.6
 RELATIVE_COUNT_ATTEMPTS = 40
+
+
+# ---------------------------------------------------------------------------
+# Question surface forms
+# ---------------------------------------------------------------------------
+# Every question type is asked in more than one way. The variants are surface
+# only: a draw computes its answer and rationale first, and the phrasing is
+# chosen afterwards, so two samples that differ only in phrasing are the same
+# sample everywhere except in the question string.
+#
+# The point is robustness to how a *person* asks. Probing the run-9 checkpoint
+# with "is there a red square above the yellow triangle" -- a phrasing the
+# generator never produced, though every word of it did occur -- made the model
+# fall back on parsing it as an existence question about the yellow triangle and
+# answer a confident, wrong "yes". On-template phrasings of the same question
+# scored near-perfectly.
+#
+# Two rules keep the variants cheap:
+#   * zero new vocabulary. Every variant is spelled with words the shipped
+#     tokenizer already holds, so a checkpoint stays fine-tunable without an
+#     embedding resize.
+#   * no polarity flips. 'is the number of circles odd' and 'are there fewer
+#     circles than squares' would need a different rationale (or a different
+#     reading of the same one) and are deliberately not offered.
+CANONICAL_WEIGHT = 0.5
+
+
+def phrase(canonical: str, *variants: str) -> str:
+    """Choose a surface form: the canonical phrasing half the time, else a variant.
+
+    Keeping the canonical form the plurality draw preserves the distribution the
+    shipped checkpoints were trained on; the variants share the other half
+    equally, which is enough exposure for the model to stop reading a phrasing
+    as the type it happens to resemble.
+    """
+    if not variants or random.random() < CANONICAL_WEIGHT:
+        return canonical
+    return random.choice(list(variants))
 
 
 def pluralize(word: str) -> str:
@@ -386,10 +433,17 @@ CORRECTION_RESERVE = 16
 # ~0.3% of injections overflow the context. inject_correction therefore also
 # charges the words spent outside the rationale: a caller that knows them passes
 # `reserved_words`, and a caller that does not is charged this worst case.
-# 31 = the longest question the generators can build (a depth-4 chain:
-# 'is a {D1} {r1} the {D2}' = 9 words, then 7 per extra hop) plus a one-word
-# answer. validate_traces asserts no sample ever exceeds it.
-QUESTION_RESERVE = 31
+# 32 = the longest question the generators can build plus a one-word answer.
+# The longest question is a depth-4 chain in its 'is there a' surface form,
+# every descriptor a color+shape pair and every relation two words:
+# 'is there a {D1} {r1} the {D2}' = 10 words, then ' that is {r} the {D}' = 7
+# per extra hop, so 10 + 3*7 = 31. (The canonical 'is a ...' form is one word
+# shorter, which is where the previous value of 31 came from.) No other type
+# comes close: the longest non-chain question is count_difference at 16 words
+# (17 with its answer), and the longest answer -- an ordinal rank naming four
+# tied shapes, 7 words -- rides on an 8-word question, 15 in total.
+# validate_traces asserts no sample ever exceeds it.
+QUESTION_RESERVE = 32
 
 _SIZE_ALT = '|'.join(SIZE_NAMES)
 _COLOR_ALT = '|'.join(COLOR_NAMES)
@@ -652,7 +706,11 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_existence_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'is there a red circle' -- enumerate matches, then count."""
+        """'is there a red circle' -- enumerate matches, then count.
+
+        Also asked in the plural ('are there any red circles', 'are there red
+        circles'): the question is about the set being non-empty either way.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -661,9 +719,12 @@ class RationaleGenerator:
             objs = filter_objects(metadata_list, desc)
             steps = enumeration_steps(objs, f"no {desc.text(True)} found")
             steps.append(f"count is {len(objs)}")
-            return (f"is there a {desc.text()}",
-                    'yes' if objs else 'no',
-                    ' . '.join(steps))
+            question = phrase(
+                f"is there a {desc.text()}",
+                f"are there any {desc.text(True)}",
+                f"are there {desc.text(True)}",
+            )
+            return question, 'yes' if objs else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -685,10 +746,11 @@ class RationaleGenerator:
             steps = enumeration_steps(objs, f"no {desc.text(True)} found")
             steps.append(f"count on {side} is {on_that_side}")
 
-            question = random.choice([
+            question = phrase(
                 f"is there a {desc.text()} on the {side}",
                 f"are there any {desc.text(True)} on the {side}",
-            ])
+                f"are there {desc.text(True)} on the {side}",
+            )
             return question, 'yes' if on_that_side else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
@@ -698,7 +760,11 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_counting_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'how many blue crosses are there' -- enumerate matches, then count."""
+        """'how many blue crosses are there' -- enumerate matches, then count.
+
+        Also asked without the trailing 'are there', and as 'what is the
+        number/count of {Xs}'.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -708,9 +774,13 @@ class RationaleGenerator:
             objs = filter_objects(metadata_list, desc)
             steps = enumeration_steps(objs, f"no {desc.text(True)} found")
             steps.append(f"count is {len(objs)}")
-            candidate = (f"how many {desc.text(True)} are there",
-                         str(len(objs)),
-                         ' . '.join(steps))
+            question = phrase(
+                f"how many {desc.text(True)} are there",
+                f"how many {desc.text(True)}",
+                f"what is the number of {desc.text(True)}",
+                f"what is the count of {desc.text(True)}",
+            )
+            candidate = (question, str(len(objs)), ' . '.join(steps))
             if _fits(candidate):
                 return candidate
         return candidate
@@ -720,7 +790,11 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_size_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'are there any large shapes' -- enumerate size matches, then count."""
+        """'are there any large shapes' -- enumerate size matches, then count.
+
+        Also asked in the singular ('is there a large shape'): both ask whether
+        the size band is occupied at all.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -730,9 +804,12 @@ class RationaleGenerator:
             steps = enumeration_steps(objs, f"no {size} {pluralize(GENERIC_NOUN)} found",
                                       with_size=True)
             steps.append(f"count is {len(objs)}")
-            return (f"are there any {size} {pluralize(GENERIC_NOUN)}",
-                    'yes' if objs else 'no',
-                    ' . '.join(steps))
+            question = phrase(
+                f"are there any {size} {pluralize(GENERIC_NOUN)}",
+                f"are there {size} {pluralize(GENERIC_NOUN)}",
+                f"is there a {size} {GENERIC_NOUN}",
+            )
+            return question, 'yes' if objs else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -741,7 +818,14 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_relative_position_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'is a circle above a red square' -- enumerate both sets, then cite a witness."""
+        """'is a circle above a red square' -- enumerate both sets, then cite a witness.
+
+        The 'is there a {X} {rel} a {Y}' and 'are there any {Xs} {rel} a {Y}'
+        forms ask the same existential question (some X stands {rel} some Y) and
+        get the same trace; the definite 'the {Y}' is deliberately not offered
+        here, since a definite referent is the relative_count question and comes
+        with the ambiguity semantics that go with it.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -774,7 +858,11 @@ class RationaleGenerator:
                 steps.append('none found')
                 answer = 'no'
 
-            question = f"is a {desc_a.text()} {relation} a {desc_b.text()}"
+            question = phrase(
+                f"is a {desc_a.text()} {relation} a {desc_b.text()}",
+                f"is there a {desc_a.text()} {relation} a {desc_b.text()}",
+                f"are there any {desc_a.text(True)} {relation} a {desc_b.text()}",
+            )
             return question, answer, ' . '.join(steps)
 
         return self._balanced(draw)
@@ -784,7 +872,13 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_side_count_comparison_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'are there more circles on the left' -- counts are computed per named side."""
+        """'are there more circles on the left' -- counts are computed per named side.
+
+        The long form spells out the comparison the short one leaves implicit
+        ('... on the left than on the right'); it always names the *opposite*
+        side, which is the only side the trace counts, so the two forms are the
+        same question.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -802,9 +896,12 @@ class RationaleGenerator:
             steps.append(f"count on {other} is {elsewhere}")
             steps.append(f"{here} {comparison_phrase(here, elsewhere)} {elsewhere}")
 
-            return (f"are there more {desc.text(True)} on the {side}",
-                    'yes' if here > elsewhere else 'no',
-                    ' . '.join(steps))
+            question = phrase(
+                f"are there more {desc.text(True)} on the {side}",
+                f"are there more {desc.text(True)} on the {side} "
+                f"than on the {other}",
+            )
+            return question, 'yes' if here > elsewhere else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -813,7 +910,13 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_comparison_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'are there more circles than red shapes' -- scoped counts, then compare."""
+        """'are there more circles than red shapes' -- scoped counts, then compare.
+
+        Also asked as 'is the number/count of {Xs} greater than the
+        number/count of {Ys}'. Only the strictly-greater direction is offered:
+        'fewer' and 'at least as many' would be different questions about the
+        same two counts, not different words for this one.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -833,9 +936,14 @@ class RationaleGenerator:
             steps.append(f"count of {desc_b.text(True)} is {count_b}")
             steps.append(f"{count_a} {comparison_phrase(count_a, count_b)} {count_b}")
 
-            return (f"are there more {desc_a.text(True)} than {desc_b.text(True)}",
-                    'yes' if count_a > count_b else 'no',
-                    ' . '.join(steps))
+            question = phrase(
+                f"are there more {desc_a.text(True)} than {desc_b.text(True)}",
+                f"is the number of {desc_a.text(True)} greater than "
+                f"the number of {desc_b.text(True)}",
+                f"is the count of {desc_a.text(True)} greater than "
+                f"the count of {desc_b.text(True)}",
+            )
+            return question, 'yes' if count_a > count_b else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -901,8 +1009,18 @@ class RationaleGenerator:
 
     @staticmethod
     def _chain_question(descs: Sequence[Descriptor], relations: Sequence[str]) -> str:
-        """'is a D1 r1 the D2 that is r2 the D3 that is r3 the D4'."""
-        question = f"is a {descs[0].text()} {relations[0]} the {descs[1].text()}"
+        """'is a D1 r1 the D2 that is r2 the D3 that is r3 the D4'.
+
+        The head clause is also asked as 'is there a D1 ...' -- the form a
+        person reaches for first, and the one whose absence from training let
+        the model mistake a relational question for an existence question about
+        the last noun it recognized. Only the head varies: the 'that is {rel}
+        the {D}' hops are the same in both forms, so a chain stays parseable
+        hop by hop. This is also the longest question the generators build, and
+        QUESTION_RESERVE is derived from its 'is there a' form.
+        """
+        head = phrase(f"is a {descs[0].text()}", f"is there a {descs[0].text()}")
+        question = f"{head} {relations[0]} the {descs[1].text()}"
         for i in range(1, len(relations)):
             question += f" that is {relations[i]} the {descs[i + 1].text()}"
         return question
@@ -992,7 +1110,11 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_parity_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'are there an even number of red circles' -- count, then read parity."""
+        """'are there an even number of red circles' -- count, then read parity.
+
+        Every form asks about evenness; 'is the number of {Xs} odd' would invert
+        the answer against an unchanged trace and is left out on purpose.
+        """
         if not metadata_list:
             return None, None, None
 
@@ -1004,9 +1126,12 @@ class RationaleGenerator:
             steps = enumeration_steps(objs, f"no {desc.text(True)} found")
             steps.append(f"count is {n}")
             steps.append(f"{n} is {'even' if n % 2 == 0 else 'odd'}")
-            return (f"are there an even number of {desc.text(True)}",
-                    'yes' if n % 2 == 0 else 'no',
-                    ' . '.join(steps))
+            question = phrase(
+                f"are there an even number of {desc.text(True)}",
+                f"is the number of {desc.text(True)} even",
+                f"is the count of {desc.text(True)} even",
+            )
+            return question, 'yes' if n % 2 == 0 else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -1048,10 +1173,13 @@ class RationaleGenerator:
             steps.append(f"count of {desc_b.text(True)} is {count_b}")
             steps.append(f"difference is {abs(count_a - count_b)}")
 
-            return (f"what is the difference between the number of "
-                    f"{desc_a.text(True)} and the number of {desc_b.text(True)}",
-                    str(abs(count_a - count_b)),
-                    ' . '.join(steps))
+            question = phrase(
+                f"what is the difference between the number of "
+                f"{desc_a.text(True)} and the number of {desc_b.text(True)}",
+                f"what is the difference between the count of "
+                f"{desc_a.text(True)} and the count of {desc_b.text(True)}",
+            )
+            return question, str(abs(count_a - count_b)), ' . '.join(steps)
 
         return self._draw_toward(draw, str(random.randint(0, DIFFERENCE_TARGET_MAX)),
                                  attempts=DIFFERENCE_ATTEMPTS)
@@ -1062,7 +1190,8 @@ class RationaleGenerator:
 
     def generate_ordinal_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
         """'what shape is third from the left' -- enumerate along the axis, then
-        name the k-th *rank*.
+        name the k-th *rank*. Also asked as 'which shape is ...' and 'what is
+        the third shape from the ...'.
 
         Ranking is dense (see axis_groups): objects sharing the queried axis
         coordinate share a rank, and a shared rank answers with every distinct
@@ -1086,9 +1215,13 @@ class RationaleGenerator:
         steps = enumeration_steps(ordered, f"no {pluralize(GENERIC_NOUN)} found")
         steps.append(ordinal_step(ORDINALS[k - 1], side, groups[k - 1]))
 
-        candidate = (f"what shape is {ORDINALS[k - 1]} from the {side}",
-                     group_text(groups[k - 1]),
-                     ' . '.join(steps))
+        ordinal = ORDINALS[k - 1]
+        question = phrase(
+            f"what shape is {ordinal} from the {side}",
+            f"which shape is {ordinal} from the {side}",
+            f"what is the {ordinal} {GENERIC_NOUN} from the {side}",
+        )
+        candidate = (question, group_text(groups[k - 1]), ' . '.join(steps))
         return candidate if _fits(candidate) else (None, None, None)
 
     # ------------------------------------------------------------------
@@ -1098,6 +1231,11 @@ class RationaleGenerator:
     def _draw_relative_count(self, metadata_list: Sequence[Dict[str, Any]],
                              want_ambiguous: bool) -> Optional[Tuple[str, str, str]]:
         """One draw of 'how many {X} are {rel} the {REF}', or None to re-draw.
+
+        The surface form varies ('... are there {rel} ...', 'what is the number
+        of {X} {rel} the {REF}'); the referent stays definite and singular in
+        every one of them, because that is what makes the question resolvable --
+        or ambiguous.
 
         The referent is always anchored on an object of the scene, so it matches
         at least once; which regime the draw lands in is then decided by the
@@ -1129,8 +1267,13 @@ class RationaleGenerator:
             return None  # 'how many triangles are below the triangle'
         relation = random.choice(RELATIONS)
 
-        question = (f"how many {desc_x.text(True)} are {relation} "
-                    f"the {desc_ref.text()}")
+        question = phrase(
+            f"how many {desc_x.text(True)} are {relation} the {desc_ref.text()}",
+            f"how many {desc_x.text(True)} are there {relation} "
+            f"the {desc_ref.text()}",
+            f"what is the number of {desc_x.text(True)} {relation} "
+            f"the {desc_ref.text()}",
+        )
         steps = enumeration_steps(referents, f"no {desc_ref.text(True)} found")
 
         if want_ambiguous:

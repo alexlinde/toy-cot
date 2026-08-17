@@ -24,13 +24,16 @@ from text import TextProcessor
 
 CANVAS_SCALE = 4  # 64x64 scene -> 256x256 display
 
+# A mix of the canonical templates and the alternative phrasings each question
+# type is also trained on (see questions.phrase), so the examples advertise that
+# there is more than one way to ask.
 EXAMPLE_QUESTIONS = [
     "is there a red circle",
     "how many circles are there",
-    "is a square above a circle",
-    "are there more squares than circles",
-    "is there a triangle on the left",
-    "are there any large shapes",
+    "is there a square above a circle",
+    "is the number of squares greater than the number of circles",
+    "are there any triangles on the left",
+    "which shape is second from the left",
 ]
 
 
