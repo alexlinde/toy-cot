@@ -10,7 +10,9 @@ checked:
   really sits in that quantized cell, and the enumeration is complete and in
   the order the question implies (raster order, or the axis order for ordinal
   questions). Two objects may share a quantized cell, so an enumeration may
-  legitimately repeat a line -- multiplicity is checked per enumerated set;
+  legitimately repeat a line -- multiplicity is checked per enumerated set (and,
+  for the ordinal axis order, per cell: objects in one cell are interchangeable
+  in an order defined by their coordinates);
 * every stated count equals the true count of the filtered set it claims to
   describe (including per-side counts, which is where the old generator lied);
 * every stated parity and count difference is recomputed from those counts;
@@ -18,6 +20,11 @@ checked:
   ``qualifying ...`` line of a compositional chain names an object that really
   starts a valid chain from that level onwards (re-derived here by a top-down
   existential search, not by the generator's cascade);
+* an ``ordinal`` rank is recomputed here as a *dense* rank: the objects are
+  bucketed by the axis coordinate the question counts along, the buckets are
+  ordered from the named side, and the k-th bucket -- not the k-th object -- is
+  what the trace's closing step and the answer must name, with every distinct
+  shape it holds, deduplicated and in alphabetical order;
 * a ``relative_count`` referent is resolved from the scene here, not read off
   the trace: one match makes the question answerable and the trace must exclude
   the referent from its own candidates, two or more make it unanswerable as
@@ -94,14 +101,6 @@ ORDINAL_WORDS = ['first', 'second', 'third', 'fourth']
 ORDINAL_RANK = {w: i + 1 for i, w in enumerate(ORDINAL_WORDS)}
 CHAIN_DEPTHS = [2, 3, 4]
 
-# Independent sort keys for "k-th from the {side}".
-AXIS_KEY = {
-    'left': lambda rc: (rc[1], rc[0]),
-    'right': lambda rc: (-rc[1], rc[0]),
-    'top': lambda rc: (rc[0], rc[1]),
-    'bottom': lambda rc: (-rc[0], rc[1]),
-}
-
 Descriptor = Tuple[Optional[str], Optional[str]]  # (color, shape)
 
 
@@ -159,10 +158,29 @@ def side_holds(m: Dict[str, Any], side: str) -> bool:
     raise ValueError(side)
 
 
-def axis_order(meta: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any]]:
-    """Objects ordered by distance from `side` (total order iff cells distinct)."""
-    key = AXIS_KEY[side]
-    return sorted(meta, key=lambda m: key(cell(m)))
+def axis_ranks(meta: Sequence[Dict[str, Any]], side: str) -> List[List[Dict[str, Any]]]:
+    """Dense ranking from `side`: one bucket per distinct primary-axis value.
+
+    Built from the coordinates themselves -- collect the distinct values on the
+    axis the question counts along, order them from the named side, and bucket
+    the objects by value -- rather than by slicing a pre-sorted list, so nothing
+    here mirrors the generator's construction. Within a bucket the objects are
+    ordered by the secondary axis; flattened, the buckets are the axis order the
+    trace must enumerate.
+    """
+    primary = 0 if side in ('top', 'bottom') else 1
+    secondary = 1 - primary
+    values = sorted({cell(o)[primary] for o in meta},
+                    reverse=side in ('right', 'bottom'))
+    return [sorted([o for o in meta if cell(o)[primary] == value],
+                   key=lambda o: cell(o)[secondary])
+            for value in values]
+
+
+def enum_line(o: Dict[str, Any]) -> str:
+    """The enumeration step an object is entitled to (no size prefix)."""
+    row, col = cell(o)
+    return f"{o['color']} {o['shape']} at row {row} col {col}"
 
 
 def chain_oracle(meta: Sequence[Dict[str, Any]], descs: Sequence[Descriptor],
@@ -276,7 +294,12 @@ EMPTY_STEP = re.compile(rf"no (?:({SIZE}) )?(?:({_COLOR_ALT}) )?({_NOUN_ALT}) fo
 CMP_STEP = re.compile(r"(\d+) (greater than|less than|equal to) (\d+)$")
 PARITY_STEP = re.compile(r"(\d+) is (even|odd)$")
 DIFF_STEP = re.compile(r"difference is (\d+)$")
-ORDINAL_STEP = re.compile(rf"({ORD}) from ({SIDE}) is ({SHAPE_ALT})$")
+# A tied rank names several shapes: 'third from left is circle and cross'. The
+# grammar accepts any order and any repetition -- that a list is deduplicated
+# and alphabetical is semantics, checked against the recomputed rank, not
+# something a permissive regex should quietly reject as a syntax error.
+ORDINAL_STEP = re.compile(
+    rf"({ORD}) from ({SIDE}) is ((?:{SHAPE_ALT})(?: and (?:{SHAPE_ALT}))*)$")
 PLAIN_STEPS = {'found', 'none found', AMBIGUOUS_MARKER}
 
 
@@ -332,6 +355,30 @@ class Cursor:
             prefix = f"{m['size_category']} " if with_size else ''
             self.expect(f"{prefix}{m['color']} {m['shape']} at row {row} col {col}")
 
+    def enumerate_ranks(self, ranks: Sequence[Sequence[Dict[str, Any]]]):
+        """Consume an ordinal enumeration: every rank in order, and inside a
+        rank every object in secondary-axis order.
+
+        Objects sharing a quantized cell are interchangeable here -- their
+        coordinates order them no further -- so a run of equal cells is matched
+        as a multiset and everything else position by position. Completeness
+        follows: one step is consumed per object of every rank, and a trailing
+        step left over is caught by expect_end.
+        """
+        for group in ranks:
+            i = 0
+            while i < len(group):
+                j = i
+                while j < len(group) and cell(group[j]) == cell(group[i]):
+                    j += 1
+                want = Counter(enum_line(o) for o in group[i:j])
+                got = Counter(self.take() for _ in range(j - i))
+                if got != want:
+                    raise SampleError(
+                        f"axis enumeration at cell {cell(group[i])}: expected "
+                        f"{sorted(want.elements())}, got {sorted(got.elements())}")
+                i = j
+
     def take_count(self, expected: int):
         step = self.take()
         m = COUNT_STEP.fullmatch(step)
@@ -384,18 +431,27 @@ class Cursor:
         if int(m.group(1)) != abs(a - b):
             raise SampleError(f"stated difference {m.group(1)} != |{a} - {b}|")
 
-    def take_ordinal(self, ordinal: str, side: str, shape: str):
+    def take_ordinal(self, ordinal: str, side: str, shapes: Sequence[str]):
+        """The closing step must name the whole k-th rank, deduped, alphabetical.
+
+        `shapes` is the recomputed rank, so this one comparison rejects a
+        dropped member, an invented one, a repeat, and a list that is merely out
+        of order ('cross and circle'): the words have to be exactly these, in
+        exactly this order.
+        """
         step = self.take()
         m = ORDINAL_STEP.fullmatch(step)
         if not m:
-            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shape}}', "
+            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shapes}}', "
                               f"got {step!r}")
         if m.group(1) != ordinal or m.group(2) != side:
             raise SampleError(f"step {step!r} answers a different question than "
                               f"{ordinal!r} from {side!r}")
-        if m.group(3) != shape:
-            raise SampleError(f"step {step!r} names {m.group(3)!r}, the {ordinal} "
-                              f"from the {side} is a {shape}")
+        named = m.group(3).split(' and ')
+        if named != list(shapes):
+            raise SampleError(f"step {step!r} names {named}, the {ordinal} rank "
+                              f"from the {side} holds {list(shapes)} (unique shapes, "
+                              f"alphabetical)")
 
     def take_comparison(self, a: int, b: int):
         step = self.take()
@@ -627,25 +683,34 @@ def check_count_difference(q, a, r, meta):
 
 
 def check_ordinal(q, a, r, meta):
+    """'what shape is third from the left', under dense ranking.
+
+    The ranks are recomputed from the coordinates (axis_ranks): rank k is the
+    k-th distinct coordinate on the counted axis with everything sitting on it,
+    so two objects in one column are one rank from the left and two ranks from
+    the top. A scene with fewer distinct coordinates than the queried rank has
+    no answer at all and must never have been drawn.
+    """
     m = parse_question('ordinal', q)
     ordinal, side = m.group(1), m.group(2)
     rank = ORDINAL_RANK[ordinal]
 
-    cells = [cell(o) for o in meta]
-    if len(set(cells)) != len(cells):
-        raise SampleError("ordinal question asked of a scene where two objects "
-                          "share a cell: the axis order is not total")
-    if rank > len(meta):
-        raise SampleError(f"asked for the {ordinal} object of a {len(meta)}-object scene")
+    ranks = axis_ranks(meta, side)
+    if rank > len(ranks):
+        raise SampleError(f"asked for the {ordinal} rank from the {side} of a scene "
+                          f"whose {len(meta)} objects occupy only {len(ranks)} "
+                          f"distinct {'row' if side in ('top', 'bottom') else 'col'} "
+                          f"values")
 
-    ordered = axis_order(meta, side)
     cur = Cursor(r)
-    cur.enumerate_set(ordered, plural_of('shape'))
-    truth = ordered[rank - 1]['shape']
+    cur.enumerate_ranks(ranks)
+    truth = sorted({o['shape'] for o in ranks[rank - 1]})
     cur.take_ordinal(ordinal, side, truth)
     cur.expect_end()
-    if a != truth:
-        raise SampleError(f"answer {a!r} != ground truth {truth!r}")
+    want = ' and '.join(truth)
+    if a != want:
+        raise SampleError(f"answer {a!r} != ground truth {want!r} (rank {rank} from "
+                          f"the {side} holds {len(ranks[rank - 1])} objects)")
 
 
 def check_relative_count(q, a, r, meta):
@@ -1300,8 +1365,14 @@ def main() -> int:
     print(f"counting answer distribution:  {numeric_spread(counting_answers)}")
     print(f"count_difference distribution: "
           f"{numeric_spread(stats['count_difference']['answers'])}")
+    ord_answers = stats['ordinal']['answers']
+    ord_total = max(1, sum(ord_answers.values()))
+    ord_tied = sum(c for k, c in ord_answers.items() if ' and ' in k)
     print(f"ordinal answer distribution:   "
-          f"{dict(sorted(stats['ordinal']['answers'].items()))}")
+          f"{dict(sorted(ord_answers.items()))}")
+    print(f"ordinal tied ranks: {100.0 * ord_tied / ord_total:.1f}% of answers name "
+          f"more than one shape (a rank whose tied objects happen to share a shape "
+          f"still answers with one word, so this understates the tie rate)")
 
     rc_answers = stats['relative_count']['answers']
     rc_total = max(1, sum(rc_answers.values()))
@@ -1382,6 +1453,9 @@ def main() -> int:
                                 f"(yes={100 * yes_share:.1f}%)")
     if counting_answers.get('0', 0) == 0:
         problems.append("counting: a count of 0 never occurred")
+    if ord_tied == 0:
+        problems.append("ordinal: no tied rank ever produced a multi-shape answer, "
+                        "the dense ranking is not being exercised")
     if rc_ambiguous == 0:
         problems.append("relative_count: the ambiguous regime never occurred")
     if rc_total - rc_ambiguous == 0:

@@ -20,6 +20,8 @@ Trace conventions
 * chain resolution:      ``qualifying {desc} at row {r} col {c}``
                          then ``found`` (yes) or ``none found`` (no)
 * ordinal:               ``{ordinal} from {side} is {shape}``
+                         / ``{ordinal} from {side} is {shape} and {shape}``
+                         (a tied rank names every distinct shape it holds)
 * unresolvable referent: ``ambiguous`` (answer ``which {desc}``)
 * correction:            ``wait`` (see inject_correction)
 
@@ -75,7 +77,9 @@ DIFFICULTY_MAP: Dict[str, List[str]] = {
 
 # Literal template words that are not derivable from the lists above.
 TEMPLATE_WORDS = frozenset({
-    # question templates
+    # question templates. 'and' and 'from' are load-bearing in the ordinal trace
+    # step too ('third from left is circle and cross'), so neither may be dropped
+    # here even if the question template that first needed it changes.
     'is', 'a', 'an', 'there', 'any', 'are', 'on', 'the', 'how', 'many', 'than',
     'more', 'that', 'what', 'number', 'difference', 'between', 'and', 'from',
     # trace steps
@@ -206,14 +210,21 @@ def filter_objects(metadata_list: Sequence[Dict[str, Any]], desc: Descriptor) ->
     return raster_sorted([m for m in metadata_list if desc.matches(m)])
 
 
-# Sort keys for "k-th from the {side}". The secondary key is the cross-axis,
-# ascending, so the order is total whenever all (row, col) pairs are distinct.
+# Sort keys for "k-th from the {side}". The primary key is the axis the rank
+# counts along; the secondary key is the cross-axis, ascending, which orders the
+# objects *inside* a rank but never decides which rank they belong to.
 AXIS_KEY: Dict[str, Callable[[Tuple[int, int]], Tuple[int, int]]] = {
     'left': lambda rc: (rc[1], rc[0]),
     'right': lambda rc: (-rc[1], rc[0]),
     'top': lambda rc: (rc[0], rc[1]),
     'bottom': lambda rc: (-rc[0], rc[1]),
 }
+
+# Which coordinate of (row, col) the rank counts along, per side.
+PRIMARY_AXIS: Dict[str, int] = {'left': 1, 'right': 1, 'top': 0, 'bottom': 0}
+
+# Joins the shape names of a tied ordinal rank ('circle and cross').
+GROUP_JOINER = ' and '
 
 
 def axis_sorted(objs: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any]]:
@@ -222,10 +233,47 @@ def axis_sorted(objs: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any
     return sorted(objs, key=lambda m: key(cell_of(m)))
 
 
-def all_cells_distinct(objs: Sequence[Dict[str, Any]]) -> bool:
-    """True iff no two objects share a quantized cell (ordering is then total)."""
-    cells = [cell_of(m) for m in objs]
-    return len(set(cells)) == len(cells)
+def axis_groups(objs: Sequence[Dict[str, Any]], side: str) -> List[List[Dict[str, Any]]]:
+    """Dense ranking from `side`: one group per distinct primary-axis value.
+
+    Rank k is the k-th distinct coordinate counting from that side, together
+    with *every* object sitting on it -- two objects in the same column share
+    the same rank from the left, so a 12-object scene has at most as many ranks
+    as the grid has columns. Ties on the secondary axis do not matter: they only
+    order objects that already share a rank.
+
+    The groups are slices of axis_sorted(objs, side), so their concatenation is
+    exactly the axis order the trace enumerates.
+    """
+    index = PRIMARY_AXIS[side]
+    groups: List[List[Dict[str, Any]]] = []
+    current = None
+    for m in axis_sorted(objs, side):
+        value = cell_of(m)[index]
+        if not groups or value != current:
+            groups.append([])
+            current = value
+        groups[-1].append(m)
+    return groups
+
+
+def group_shapes(group: Sequence[Dict[str, Any]]) -> List[str]:
+    """The shape names a rank answers with: deduplicated, alphabetical.
+
+    Two circles tied on one column answer 'circle', not 'circle and circle':
+    the question asks what shape is there, and that is one answer.
+    """
+    return sorted({m['shape'] for m in group})
+
+
+def group_text(group: Sequence[Dict[str, Any]]) -> str:
+    """'circle' / 'circle and cross' / 'circle and square and triangle'."""
+    return GROUP_JOINER.join(group_shapes(group))
+
+
+def ordinal_step(ordinal: str, side: str, group: Sequence[Dict[str, Any]]) -> str:
+    """The closing step of an ordinal trace, naming the whole k-th rank."""
+    return f"{ordinal} from {side} is {group_text(group)}"
 
 
 def relation_holds(a: Dict[str, Any], b: Dict[str, Any], relation: str) -> bool:
@@ -1014,24 +1062,32 @@ class RationaleGenerator:
 
     def generate_ordinal_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
         """'what shape is third from the left' -- enumerate along the axis, then
-        read off the k-th object.
+        name the k-th *rank*.
 
-        Declines whenever two objects share a cell: the ordering along the axis
-        would not be total and the question would have no defined answer.
+        Ranking is dense (see axis_groups): objects sharing the queried axis
+        coordinate share a rank, and a shared rank answers with every distinct
+        shape on it ('circle and cross'). A scene whose objects all sit on
+        different columns therefore behaves exactly as it did under the old
+        one-object-per-rank reading.
+
+        Declines when the scene offers fewer ranks than the drawn one -- a
+        four-object scene stacked in two columns has no third from the left.
         """
-        if not metadata_list or not all_cells_distinct(metadata_list):
+        if not metadata_list:
             return None, None, None
 
         k = random.randint(1, min(len(ORDINALS), len(metadata_list)))
         side = random.choice(SIDES)
-        ordered = axis_sorted(metadata_list, side)
+        groups = axis_groups(metadata_list, side)
+        if k > len(groups):
+            return None, None, None
 
+        ordered = [m for group in groups for m in group]  # == axis_sorted(...)
         steps = enumeration_steps(ordered, f"no {pluralize(GENERIC_NOUN)} found")
-        target = ordered[k - 1]
-        steps.append(f"{ORDINALS[k - 1]} from {side} is {target['shape']}")
+        steps.append(ordinal_step(ORDINALS[k - 1], side, groups[k - 1]))
 
         candidate = (f"what shape is {ORDINALS[k - 1]} from the {side}",
-                     target['shape'],
+                     group_text(groups[k - 1]),
                      ' . '.join(steps))
         return candidate if _fits(candidate) else (None, None, None)
 
@@ -1194,8 +1250,12 @@ class RationaleGenerator:
             words.update(relation.split())
         words.update(SIDES)
 
-        # ordinals ('what shape is third from the left')
+        # ordinals ('what shape is third from the left') and the joiner that
+        # binds a tied rank's shapes ('circle and cross'). 'and' is a template
+        # word too; naming it here as well keeps the trace format's vocabulary
+        # standing on its own.
         words.update(ORDINALS)
+        words.update(GROUP_JOINER.split())
 
         # numbers: grid coordinates 0-7 and single digits, plus every count /
         # count difference reachable in a scene of up to MAX_OBJECTS objects
