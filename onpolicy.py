@@ -35,6 +35,18 @@ Special cases
   correction curriculum must never do.
 * budget overflow / empty step -> skipped (counted)
 
+STaR / rejection-sampling filtering
+------------------------------------
+Every kept sample carries an int8 `disposition` tensor recording which of the
+categories above produced it (see DISPOSITION below; mirrors KIND_ID/KINDS).
+--star restricts the saved tensors to the fully gold-supervised dispositions --
+'exact' (the model's own chain matched gold exactly) and 'early_stop' (no
+wrong step exists to condition on, so training falls back to the plain gold
+trace) -- and discards 'corrected' samples, whose saved trace still carries an
+unsupervised, model-authored wrong step. This is the STaR / rejection-sampling
+variant of the correction curriculum: fine-tune only on chains that were
+already right, rather than teaching recovery from an error.
+
 Usage:
     uv run python onpolicy.py --checkpoint run5/checkpoints/best.pth \
         --vocab run5/tokenizer_vocab.json --n 50000 --batch_size 96 \
@@ -65,6 +77,20 @@ MAX_GEN_LEN = 80
 # Sample dispositions, in the order the summary prints them.
 KINDS = ['exact', 'corrected', 'early_stop', 'skip_budget', 'skip_unusable']
 KIND_ID = {k: i for i, k in enumerate(KINDS)}
+
+# id -> name for the per-sample `disposition` tensor (int8) collect() saves.
+# Mirrors KIND_ID/KINDS above; kept as an explicit dict per the on-disk
+# contract so downstream loaders (finetune_onpolicy.py) can filter by
+# disposition without re-deriving the mapping.
+DISPOSITION = dict(enumerate(KINDS))
+
+# Dispositions eligible for --star (rejection-sampling / STaR filtering): the
+# saved rationale for both is the gold trace verbatim, fully supervised end to
+# end -- 'exact' because the model's own chain matched it, 'early_stop'
+# because there was no wrong step to condition a correction on, so
+# build_correction falls back to plain gold. Neither carries the unsupervised,
+# model-authored wrong step that 'corrected' samples do.
+STAR_KEEP_KINDS = ('exact', 'early_stop')
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +310,13 @@ def _draw_sample(shape_gen: ShapeGenerator, rationale_gen: RationaleGenerator,
 def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: int,
             out_path: str, temperature_mix: Sequence[float] = (0.0, 0.7),
             seed: int = 0, max_gen_len: int = MAX_GEN_LEN,
-            num_examples: int = 3) -> Dict[str, Any]:
-    """Sample chains, splice corrections, and save the padded training tensors."""
+            num_examples: int = 3, star: bool = False) -> Dict[str, Any]:
+    """Sample chains, splice corrections, and save the padded training tensors.
+
+    `star`: when True, keep only STAR_KEEP_KINDS dispositions ('exact' and
+    'early_stop') in the saved tensors, discarding 'corrected' samples -- the
+    STaR / rejection-sampling variant (see module docstring).
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -377,6 +408,37 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
         'seconds': time.time() - t0,
     }
 
+    if star:
+        # Filter every parallel per-sample list to STAR_KEEP_KINDS, computed
+        # against the full kinds_out before any reassignment below so the
+        # discard breakdown is exact.
+        keep_ids = {KIND_ID[k] for k in STAR_KEEP_KINDS}
+        keep_mask = [kid in keep_ids for kid in kinds_out]
+        discarded_by_kind = {
+            KINDS[kid]: sum(1 for k in kinds_out if k == kid)
+            for kid in sorted(set(kinds_out) - keep_ids)
+        }
+        star_kept = sum(keep_mask)
+        star_discarded = kept - star_kept
+        assert star_kept > 0, "[onpolicy] --star discarded every collected sample"
+
+        images_out = [t for t, keep in zip(images_out, keep_mask) if keep]
+        inp_out = [t for t, keep in zip(inp_out, keep_mask) if keep]
+        tgt_out = [t for t, keep in zip(tgt_out, keep_mask) if keep]
+        rat_out = [t for t, keep in zip(rat_out, keep_mask) if keep]
+        ans_out = [t for t, keep in zip(ans_out, keep_mask) if keep]
+        kinds_out = [kid for kid in kinds_out if kid in keep_ids]
+
+        stats['star'] = {
+            'enabled': True,
+            'keep_kinds': list(STAR_KEEP_KINDS),
+            'kept': star_kept,
+            'discarded': star_discarded,
+            'discarded_by_kind': discarded_by_kind,
+        }
+    else:
+        stats['star'] = {'enabled': False}
+
     payload = {
         'images': torch.stack(images_out),              # (N,3,64,64) uint8
         'input_tokens': torch.stack(inp_out),
@@ -384,6 +446,7 @@ def collect(model, text_processor: TextProcessor, n_samples: int, batch_size: in
         'rat_mask': torch.stack(rat_out),
         'ans_mask': torch.stack(ans_out),
         'kind': torch.tensor(kinds_out, dtype=torch.long),
+        'disposition': torch.tensor(kinds_out, dtype=torch.int8),
         'kind_names': KINDS,
         'stats': stats,
         'examples': examples,
@@ -403,6 +466,14 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"  mean first-error step index: {mfe:.2f}" if mfe is not None
           else "  mean first-error step index: n/a")
     print(f"  free-running answer EM: {stats['free_running_answer_em']:.3f}")
+
+    star = stats.get('star', {})
+    if star.get('enabled'):
+        total = star['kept'] + star['discarded']
+        rate = star['kept'] / max(1, total)
+        print(f"  --star: kept {star['kept']}/{total} ({100 * rate:5.1f}%) "
+              f"[{'+'.join(star['keep_kinds'])}], discarded {star['discarded']} "
+              f"{star['discarded_by_kind']}")
 
     for i, ex in enumerate(result['examples']):
         print(f"\n--- corrected example {i + 1} ({ex['difficulty']}, T={ex['temperature']}) ---")
@@ -457,6 +528,10 @@ def main():
     parser.add_argument("--examples", type=int, default=3)
     parser.add_argument("--stats_json", type=str, default=None,
                         help="also write the stats dict to this path")
+    parser.add_argument("--star", action="store_true",
+                        help="STaR / rejection-sampling: keep only fully "
+                             "gold-supervised samples (exact + early_stop) in "
+                             "the saved tensors, discarding corrected traces")
     args = parser.parse_args()
 
     device = best_device()
@@ -466,7 +541,7 @@ def main():
     result = collect(model, text_processor, n_samples=args.n, batch_size=args.batch_size,
                      out_path=args.out, temperature_mix=tuple(args.temperatures),
                      seed=args.seed, max_gen_len=args.max_gen_len,
-                     num_examples=args.examples)
+                     num_examples=args.examples, star=args.star)
     print_report(result)
 
     if args.stats_json:

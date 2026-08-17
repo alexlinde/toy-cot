@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import ToyVLM
+from onpolicy import KIND_ID, KINDS
 from questions import RationaleGenerator
 from runtime import setup_runtime
 from text import TextProcessor
@@ -61,14 +62,45 @@ class OnPolicyBatches:
     ragged batch.
     """
 
-    def __init__(self, path: str, batch_size: int, rng: random.Random):
+    def __init__(self, path: str, batch_size: int, rng: random.Random,
+                 exact_only: bool = False):
         data = torch.load(path, map_location='cpu', weights_only=False)
         self.images = data['images']                     # (N,3,64,64) uint8
         self.input_tokens = data['input_tokens']
         self.target_tokens = data['target_tokens']
         self.rat_mask = data['rat_mask']
         self.ans_mask = data['ans_mask']
+        self.disposition = data.get('disposition')        # (N,) int8, or None
         self.stats = data.get('stats', {})
+        n_loaded = self.input_tokens.shape[0]
+
+        if self.disposition is not None:
+            counts = torch.bincount(self.disposition.to(torch.long), minlength=len(KINDS))
+            breakdown = {KINDS[i]: int(counts[i]) for i in range(len(KINDS))}
+        else:
+            breakdown = '(no disposition tensor in this file)'
+        print(f"On-policy disposition breakdown ({n_loaded} samples): {breakdown}")
+
+        if exact_only:
+            # Datasets collected WITH --star already contain only exact/
+            # early_stop samples; --exact_only is for filtering a dataset
+            # collected WITHOUT --star down to the strictly on-policy-correct
+            # 'exact' samples at load time.
+            assert self.disposition is not None, (
+                f"[finetune] --exact_only requires a 'disposition' tensor in "
+                f"{path}, but this file has none -- it was collected with an "
+                f"older onpolicy.py. Re-collect with the current onpolicy.py "
+                f"(or drop --exact_only) to proceed.")
+            keep = self.disposition == KIND_ID['exact']
+            self.images = self.images[keep]
+            self.input_tokens = self.input_tokens[keep]
+            self.target_tokens = self.target_tokens[keep]
+            self.rat_mask = self.rat_mask[keep]
+            self.ans_mask = self.ans_mask[keep]
+            self.disposition = self.disposition[keep]
+            print(f"--exact_only: kept {self.input_tokens.shape[0]}/{n_loaded} "
+                  f"'exact' samples")
+
         self.n = self.input_tokens.shape[0]
         assert self.n >= batch_size, (
             f"[finetune] {self.n} on-policy samples cannot fill a batch of {batch_size}")
@@ -286,6 +318,10 @@ def main():
     parser.add_argument("--num_workers", type=int, default=None,
                         help="override the runtime's dataloader worker count")
     parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--exact_only", action="store_true",
+                        help="filter the on-policy pool to disposition=='exact' "
+                             "at load time (for datasets collected WITHOUT "
+                             "--star); requires a 'disposition' tensor")
     args = parser.parse_args()
 
     assert 0.0 <= args.onpolicy_frac <= 1.0, "--onpolicy_frac must be a probability"
@@ -313,7 +349,8 @@ def main():
     print(f"Initialized from {args.init_from}")
 
     onpolicy = OnPolicyBatches(args.onpolicy_data, args.batch_size,
-                               random.Random(args.seed + 2))
+                               random.Random(args.seed + 2),
+                               exact_only=args.exact_only)
     if onpolicy.stats:
         print(f"On-policy data: {onpolicy.n} samples, counts {onpolicy.stats.get('counts')}")
 
