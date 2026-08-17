@@ -32,6 +32,12 @@ Every question type is asked in two to four surface forms (see `phrase`). The
 phrasing is drawn after the answer and the rationale are computed and never
 changes either of them, so the variants train the model to read a question
 rather than to pattern-match a template.
+
+Three types are additionally asked in more than one *polarity* (see
+`draw_polarity`): parity in even/odd, and the two count comparisons in
+more/fewer (and, for `comparison`, equal). A polarity flip leaves the rationale
+untouched -- the trace states the parity or the relation outright -- and inverts
+only the answer read off it.
 """
 
 import random
@@ -87,6 +93,10 @@ TEMPLATE_WORDS = frozenset({
     # here even if the question template that first needed it changes.
     'is', 'a', 'an', 'there', 'any', 'are', 'on', 'the', 'how', 'many', 'than',
     'more', 'that', 'what', 'number', 'difference', 'between', 'and', 'from',
+    # 'fewer' is the one word the polarity variants add that no trace step ever
+    # emits ('are there fewer circles than squares'); its long-form counterpart
+    # 'less than' and the parity words 'even'/'odd' are trace words already.
+    'fewer',
     # trace steps. Several of these are question words as well now that each
     # type is asked in more than one way ('is the count of circles even',
     # 'is the number of circles greater than the number of squares'); the
@@ -170,13 +180,9 @@ RELATIVE_COUNT_ATTEMPTS = 40
 # answer a confident, wrong "yes". On-template phrasings of the same question
 # scored near-perfectly.
 #
-# Two rules keep the variants cheap:
-#   * zero new vocabulary. Every variant is spelled with words the shipped
-#     tokenizer already holds, so a checkpoint stays fine-tunable without an
-#     embedding resize.
-#   * no polarity flips. 'is the number of circles odd' and 'are there fewer
-#     circles than squares' would need a different rationale (or a different
-#     reading of the same one) and are deliberately not offered.
+# The variants stay cheap in vocabulary: they are spelled, wherever possible,
+# with words the traces already use. The one word this whole file adds beyond
+# the original templates is 'fewer' (see the polarity section below).
 CANONICAL_WEIGHT = 0.5
 
 
@@ -191,6 +197,67 @@ def phrase(canonical: str, *variants: str) -> str:
     if not variants or random.random() < CANONICAL_WEIGHT:
         return canonical
     return random.choice(list(variants))
+
+
+# ---------------------------------------------------------------------------
+# Question polarity
+# ---------------------------------------------------------------------------
+# Three types ask about a fact their trace already states in full: parity states
+# '{n} is even' or '{n} is odd', and both count comparisons state
+# '{a} greater than {b}' / 'less than' / 'equal to'. The same trace therefore
+# answers the question in either polarity -- 'is the number of circles even' and
+# 'is the number of circles odd' read opposite answers off the one step '3 is
+# odd' -- so the polarity is a property of the *question*, not of the trace, and
+# nothing in a rationale changes when it flips.
+#
+# Unlike a surface variant, a polarity changes the answer. Two consequences run
+# through the code below:
+#   * the polarity is drawn inside draw(), so the answer-prior balancing loop
+#     (_balanced / _draw_toward) steers over polarity and descriptors together
+#     instead of being handed a fixed polarity it cannot satisfy;
+#   * validate_traces parses the asked polarity out of the question and
+#     recomputes the answer from it, so an 'odd' question carrying an answer
+#     computed for 'even' fails validation.
+#
+# The canonical polarity ('even', 'more') stays the majority draw: inversions
+# are the rarer way to ask, and a training mixture dominated by them would
+# misrepresent the task.
+POLARITY_CANONICAL_PROB = 0.7
+
+# Parity polarities, in the two words the trace already uses.
+PARITY_POLARITIES: List[str] = ['even', 'odd']
+
+# Count-comparison polarities, in three parallel tables: the phrase the long
+# surface form spells each one with ('is the number of X {phrase} the number of
+# Y'), the word the short form uses ('are there {word} X than Y'), and the test
+# the answer is read off. Only the two strict directions have a short form:
+# saying equality that way ('as many ... as') would need two new words, and the
+# long form already says it.
+COMPARISON_PHRASES: Dict[str, str] = {
+    'more': 'greater than',
+    'fewer': 'less than',
+    'equal': 'equal to',
+}
+COMPARISON_SHORT: Dict[str, str] = {'more': 'more', 'fewer': 'fewer'}
+COMPARISON_TESTS: Dict[str, Callable[[int, int], bool]] = {
+    'more': lambda a, b: a > b,
+    'fewer': lambda a, b: a < b,
+    'equal': lambda a, b: a == b,
+}
+# Polarities the two comparison types offer. side_count_comparison leaves out
+# 'equal': a scene where a descriptor is equally split across two halves is an
+# unremarkable draw, but 'are there equal ...' has no short surface form and the
+# long one ('is the count of circles on the left equal to the count on the
+# right') is a different, longer question shape than this type's other forms.
+COMPARISON_POLARITIES: List[str] = ['more', 'fewer', 'equal']
+SIDE_COMPARISON_POLARITIES: List[str] = ['more', 'fewer']
+
+
+def draw_polarity(canonical: str, *alternatives: str) -> str:
+    """Draw the polarity a question asks in, canonical polarity most of the time."""
+    if not alternatives or random.random() < POLARITY_CANONICAL_PROB:
+        return canonical
+    return random.choice(list(alternatives))
 
 
 def pluralize(word: str) -> str:
@@ -878,6 +945,10 @@ class RationaleGenerator:
         ('... on the left than on the right'); it always names the *opposite*
         side, which is the only side the trace counts, so the two forms are the
         same question.
+
+        Asked in both polarities: 'fewer' inverts the test the answer is read
+        off ({here} < {elsewhere}) and leaves the trace, which states the two
+        counts and their relation outright, exactly as it was.
         """
         if not metadata_list:
             return None, None, None
@@ -896,12 +967,15 @@ class RationaleGenerator:
             steps.append(f"count on {other} is {elsewhere}")
             steps.append(f"{here} {comparison_phrase(here, elsewhere)} {elsewhere}")
 
+            pol = draw_polarity(*SIDE_COMPARISON_POLARITIES)
+            word = COMPARISON_SHORT[pol]
             question = phrase(
-                f"are there more {desc.text(True)} on the {side}",
-                f"are there more {desc.text(True)} on the {side} "
+                f"are there {word} {desc.text(True)} on the {side}",
+                f"are there {word} {desc.text(True)} on the {side} "
                 f"than on the {other}",
             )
-            return question, 'yes' if here > elsewhere else 'no', ' . '.join(steps)
+            answer = 'yes' if COMPARISON_TESTS[pol](here, elsewhere) else 'no'
+            return question, answer, ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -913,9 +987,10 @@ class RationaleGenerator:
         """'are there more circles than red shapes' -- scoped counts, then compare.
 
         Also asked as 'is the number/count of {Xs} greater than the
-        number/count of {Ys}'. Only the strictly-greater direction is offered:
-        'fewer' and 'at least as many' would be different questions about the
-        same two counts, not different words for this one.
+        number/count of {Ys}', and in all three polarities the trace's closing
+        step already decides: more (>), fewer (<) and equal (==). The trace is
+        the same either way -- it states both counts and the relation between
+        them -- so only the answer moves.
         """
         if not metadata_list:
             return None, None, None
@@ -936,14 +1011,23 @@ class RationaleGenerator:
             steps.append(f"count of {desc_b.text(True)} is {count_b}")
             steps.append(f"{count_a} {comparison_phrase(count_a, count_b)} {count_b}")
 
-            question = phrase(
-                f"are there more {desc_a.text(True)} than {desc_b.text(True)}",
-                f"is the number of {desc_a.text(True)} greater than "
+            pol = draw_polarity(*COMPARISON_POLARITIES)
+            long_form = COMPARISON_PHRASES[pol]
+            forms = [
+                f"is the number of {desc_a.text(True)} {long_form} "
                 f"the number of {desc_b.text(True)}",
-                f"is the count of {desc_a.text(True)} greater than "
+                f"is the count of {desc_a.text(True)} {long_form} "
                 f"the count of {desc_b.text(True)}",
-            )
-            return question, 'yes' if count_a > count_b else 'no', ' . '.join(steps)
+            ]
+            short = COMPARISON_SHORT.get(pol)
+            if short is not None:
+                question = phrase(
+                    f"are there {short} {desc_a.text(True)} than {desc_b.text(True)}",
+                    *forms)
+            else:  # 'equal' has no short form, so the long one is canonical
+                question = phrase(*forms)
+            answer = 'yes' if COMPARISON_TESTS[pol](count_a, count_b) else 'no'
+            return question, answer, ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -1112,8 +1196,10 @@ class RationaleGenerator:
     def generate_parity_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
         """'are there an even number of red circles' -- count, then read parity.
 
-        Every form asks about evenness; 'is the number of {Xs} odd' would invert
-        the answer against an unchanged trace and is left out on purpose.
+        Asked in both polarities. The trace states the count's true parity
+        either way ('3 is odd'); what the polarity decides is whether that makes
+        the answer yes or no, so an 'odd' question over an odd count answers
+        'yes' off exactly the trace an 'even' question answers 'no' off.
         """
         if not metadata_list:
             return None, None, None
@@ -1125,13 +1211,15 @@ class RationaleGenerator:
             n = len(objs)
             steps = enumeration_steps(objs, f"no {desc.text(True)} found")
             steps.append(f"count is {n}")
-            steps.append(f"{n} is {'even' if n % 2 == 0 else 'odd'}")
+            parity = 'even' if n % 2 == 0 else 'odd'
+            steps.append(f"{n} is {parity}")
+            asked = draw_polarity(*PARITY_POLARITIES)
             question = phrase(
-                f"are there an even number of {desc.text(True)}",
-                f"is the number of {desc.text(True)} even",
-                f"is the count of {desc.text(True)} even",
+                f"are there an {asked} number of {desc.text(True)}",
+                f"is the number of {desc.text(True)} {asked}",
+                f"is the count of {desc.text(True)} {asked}",
             )
-            return question, 'yes' if n % 2 == 0 else 'no', ' . '.join(steps)
+            return question, 'yes' if parity == asked else 'no', ' . '.join(steps)
 
         return self._balanced(draw)
 
@@ -1392,6 +1480,15 @@ class RationaleGenerator:
         for relation in RELATIONS:
             words.update(relation.split())
         words.update(SIDES)
+
+        # question polarities. Every word here is a template or trace word too
+        # ('greater', 'less', 'equal', 'to', 'even', 'odd', 'more') except
+        # 'fewer'; naming the polarity table's own words here keeps it able to
+        # grow without a silent out-of-vocabulary question.
+        words.update(PARITY_POLARITIES)
+        words.update(COMPARISON_SHORT.values())
+        for comparison in COMPARISON_PHRASES.values():
+            words.update(comparison.split())
 
         # ordinals ('what shape is third from the left') and the joiner that
         # binds a tied rank's shapes ('circle and cross'). 'and' is a template

@@ -128,9 +128,20 @@ class ToyVLMGUI:
         self.text_processor = TextProcessor()
         self.text_processor.tokenizer.load_vocab(vocab)
 
-        # Build the model and load trained weights.
+        # Build the model and load trained weights. A checkpoint is paired with
+        # the vocabulary it was trained on: the embedding has one row per token,
+        # so a vocabulary that has grown since (a new question word) makes the
+        # rows not line up. Say that here rather than let load_state_dict report
+        # four size mismatches and leave the reader to infer why.
         self.model = ToyVLM(self.text_processor)
         state = torch.load(checkpoint, map_location='cpu')
+        ckpt_vocab = state['token_embedding.weight'].shape[0]
+        vocab_size = self.text_processor.tokenizer.get_vocab_size()
+        if ckpt_vocab != vocab_size:
+            sys.exit(f"Checkpoint '{checkpoint}' was trained with {ckpt_vocab} "
+                     f"tokens, but '{vocab}' now holds {vocab_size}. They are a "
+                     f"pair: retrain with train_model.py (which rewrites the "
+                     f"vocabulary) or point --checkpoint/--vocab at a matching set.")
         self.model.load_state_dict(state)
 
         self.device = best_device()

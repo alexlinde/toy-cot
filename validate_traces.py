@@ -104,6 +104,20 @@ ORDINAL_WORDS = ['first', 'second', 'third', 'fourth']
 ORDINAL_RANK = {w: i + 1 for i, w in enumerate(ORDINAL_WORDS)}
 CHAIN_DEPTHS = [2, 3, 4]
 
+# Question polarities, spelled out again here rather than imported: a polarity
+# decides the answer, so the reading of 'fewer' has to be re-derived on this
+# side of the validator like every other piece of semantics.
+PARITY_POLARITIES = ['even', 'odd']
+# Both surface spellings of each count-comparison polarity ('are there more X
+# than Y' / 'is the number of X greater than the number of Y').
+COMPARISON_POLARITIES = {
+    'more': lambda a, b: a > b,
+    'greater than': lambda a, b: a > b,
+    'fewer': lambda a, b: a < b,
+    'less than': lambda a, b: a < b,
+    'equal to': lambda a, b: a == b,
+}
+
 Descriptor = Tuple[Optional[str], Optional[str]]  # (color, shape)
 
 
@@ -257,6 +271,13 @@ SIDE = '|'.join(SIDES)
 SIZE = '|'.join(SIZES)
 SHAPE_ALT = '|'.join(SHAPES)
 ORD = '|'.join(ORDINAL_WORDS)
+PARITY_ALT = '|'.join(PARITY_POLARITIES)
+# The two spelling families of a count-comparison polarity, written out rather
+# than derived from COMPARISON_POLARITIES so the grammar keeps saying which
+# words may appear where: only the short pair can follow 'are there', and only
+# the long triple can precede 'the number of'.
+CMP_SHORT_ALT = 'more|fewer'
+CMP_LONG_ALT = 'greater than|less than|equal to'
 
 
 def chain_question_pattern(hops: int) -> 're.Pattern':
@@ -299,17 +320,23 @@ Q_PATTERNS = {
     'size': re.compile(rf"(?:are there any|are there|is there a) ({SIZE}) shapes?$"),
     'relative_position': re.compile(
         rf"(?:is a|is there a|are there any) ({DESC}) ({REL}) a ({DESC})$"),
-    # The third group is the explicitly named opposite side of the long form
-    # ('... on the left than on the right'), and None in the short one; the
-    # checker rejects any side other than the opposite of group 2.
+    # Group 1 is the polarity, group 4 the explicitly named opposite side of the
+    # long form ('... on the left than on the right') and None in the short one;
+    # the checker rejects any side other than the opposite of group 3.
     'side_count_comparison': re.compile(
-        rf"are there more ({DESC}) on the ({SIDE})(?: than on the ({SIDE}))?$"),
+        rf"are there ({CMP_SHORT_ALT}) ({DESC}) on the ({SIDE})"
+        rf"(?: than on the ({SIDE}))?$"),
+    # Polarity slots: a question states it before the descriptor ('are there an
+    # odd number of circles') or after it ('is the number of circles odd'), and
+    # the checker demands exactly one of the two -- which is what stops the
+    # permissive prefix/tail pairing used elsewhere in this table from accepting
+    # a question with two polarities in it, or none.
     'parity': re.compile(
-        rf"(?:are there an even number of|is the (?:number|count) of) ({DESC})"
-        rf"(?: even)?$"),
+        rf"(?:are there an ({PARITY_ALT}) number of|is the (?:number|count) of) "
+        rf"({DESC})(?: ({PARITY_ALT}))?$"),
     'comparison': re.compile(
-        rf"(?:are there more|is the (?:number|count) of) ({DESC}) "
-        rf"(?:than|greater than the (?:number|count) of) ({DESC})$"),
+        rf"(?:are there ({CMP_SHORT_ALT})|is the (?:number|count) of) ({DESC}) "
+        rf"(?:than|({CMP_LONG_ALT}) the (?:number|count) of) ({DESC})$"),
     'count_difference': re.compile(
         rf"what is the difference between the (?:number|count) of ({DESC}) and "
         rf"the (?:number|count) of ({DESC})$"),
@@ -588,6 +615,29 @@ def parse_question(qtype: str, question: str):
     return m
 
 
+def asked_polarity(m, question: str, *slots: int) -> str:
+    """The polarity a question asks in, from the one capture slot that fired.
+
+    A polarity decides the answer, so a question that states it twice ('are
+    there an even number of circles odd') or not at all is not merely oddly
+    worded -- it has no single reading, and there is nothing to check an answer
+    against.
+    """
+    found = [m.group(i) for i in slots if m.group(i) is not None]
+    if len(found) != 1:
+        raise SampleError(f"question {question!r} states {len(found)} polarities, "
+                          f"expected exactly one")
+    return found[0]
+
+
+def comparison_truth(polarity: str, a: int, b: int) -> bool:
+    """Read a count comparison in the polarity the question asked it in."""
+    test = COMPARISON_POLARITIES.get(polarity)
+    if test is None:
+        raise SampleError(f"unknown comparison polarity {polarity!r}")
+    return test(a, b)
+
+
 def check_existence(q, a, r, meta):
     desc = parse_desc(parse_question('existence', q).group(1))
     objs = select(meta, desc)
@@ -654,15 +704,22 @@ def check_relative_position(q, a, r, meta):
 
 
 def check_side_count_comparison(q, a, r, meta):
+    """'are there more/fewer circles on the left [than on the right]'.
+
+    The trace is the same in both polarities -- two per-side counts and the
+    relation between them -- so the polarity is recovered from the question and
+    the answer recomputed from it here.
+    """
     m = parse_question('side_count_comparison', q)
-    desc, side = parse_desc(m.group(1)), m.group(2)
+    polarity = m.group(1)
+    desc, side = parse_desc(m.group(2)), m.group(3)
     other = OPPOSITE[side]
     # The long surface form names the compared side out loud. It has to be the
     # opposite one: the trace counts `side` against `other` and nothing else, so
     # a question naming any other side would be answered by a trace about a
     # different comparison.
-    if m.group(3) is not None and m.group(3) != other:
-        raise SampleError(f"question compares the {side} with the {m.group(3)}, "
+    if m.group(4) is not None and m.group(4) != other:
+        raise SampleError(f"question compares the {side} with the {m.group(4)}, "
                           f"but the trace counts the {side} against the {other}")
     objs = select(meta, desc)
     here = sum(1 for o in objs if side_holds(o, side))
@@ -674,15 +731,22 @@ def check_side_count_comparison(q, a, r, meta):
     cur.take_count_on(other, there)
     cur.take_comparison(here, there)
     cur.expect_end()
-    want = 'yes' if here > there else 'no'
+    want = 'yes' if comparison_truth(polarity, here, there) else 'no'
     if a != want:
-        raise SampleError(f"answer {a!r} != ground truth {want!r} ({side}={here}, "
-                          f"{other}={there})")
+        raise SampleError(f"answer {a!r} != ground truth {want!r} for a {polarity!r} "
+                          f"question ({side}={here}, {other}={there})")
 
 
 def check_comparison(q, a, r, meta):
+    """'are there more/fewer circles than squares', 'is the number of ... equal to ...'.
+
+    The trace states both counts and their relation whatever was asked, so the
+    polarity comes from the question -- the short 'more'/'fewer' slot or the
+    long 'greater than'/'less than'/'equal to' one, exactly one of which fires.
+    """
     m = parse_question('comparison', q)
-    desc_a, desc_b = parse_desc(m.group(1)), parse_desc(m.group(2))
+    polarity = asked_polarity(m, q, 1, 3)
+    desc_a, desc_b = parse_desc(m.group(2)), parse_desc(m.group(4))
     objs_a, objs_b = select(meta, desc_a), select(meta, desc_b)
 
     cur = Cursor(r)
@@ -692,22 +756,34 @@ def check_comparison(q, a, r, meta):
     cur.take_count_of(desc_b, len(objs_b))
     cur.take_comparison(len(objs_a), len(objs_b))
     cur.expect_end()
-    want = 'yes' if len(objs_a) > len(objs_b) else 'no'
+    want = 'yes' if comparison_truth(polarity, len(objs_a), len(objs_b)) else 'no'
     if a != want:
-        raise SampleError(f"answer {a!r} != ground truth {want!r}")
+        raise SampleError(f"answer {a!r} != ground truth {want!r} for a {polarity!r} "
+                          f"question ({len(objs_a)} vs {len(objs_b)})")
 
 
 def check_parity(q, a, r, meta):
-    desc = parse_desc(parse_question('parity', q).group(1))
+    """'are there an even/odd number of red circles'.
+
+    take_parity checks the trace against the count's *true* parity; the answer
+    is then whether that parity is the one the question asked about, so an odd
+    count answers 'yes' to an odd question and 'no' to an even one off the same
+    trace.
+    """
+    m = parse_question('parity', q)
+    asked = asked_polarity(m, q, 1, 3)
+    desc = parse_desc(m.group(2))
     objs = select(meta, desc)
     cur = Cursor(r)
     cur.enumerate_set(objs, desc_text(desc, True))
     cur.take_count(len(objs))
     cur.take_parity(len(objs))
     cur.expect_end()
-    truth = 'yes' if len(objs) % 2 == 0 else 'no'
+    parity = 'even' if len(objs) % 2 == 0 else 'odd'
+    truth = 'yes' if parity == asked else 'no'
     if a != truth:
-        raise SampleError(f"answer {a!r} != ground truth {truth!r} (count {len(objs)})")
+        raise SampleError(f"answer {a!r} != ground truth {truth!r}: {len(objs)} is "
+                          f"{parity}, the question asked {asked!r}")
 
 
 def check_count_difference(q, a, r, meta):
