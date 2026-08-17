@@ -8,14 +8,9 @@ checked:
 
 * each enumerated ``{color} {shape} at row r col c`` names a real object that
   really sits in that quantized cell, and the enumeration is complete and in
-  raster order -- for every type, ordinal included. Two objects may share a
-  quantized cell, so an enumeration may legitimately repeat a line --
-  multiplicity is checked per enumerated set;
-* an ``ordinal`` trace's sorted walk is checked against an axis order recomputed
-  here: rank by rank, the step must name the object this validator puts at that
-  rank and cite that object's true coordinate on the axis the side is measured
-  on. A walk that is internally coherent but sorted wrongly fails, however well
-  it agrees with the answer it leads to;
+  the order the question implies (raster order, or the axis order for ordinal
+  questions). Two objects may share a quantized cell, so an enumeration may
+  legitimately repeat a line -- multiplicity is checked per enumerated set;
 * every stated count equals the true count of the filtered set it claims to
   describe (including per-side counts, which is where the old generator lied);
 * every stated parity and count difference is recomputed from those counts;
@@ -106,9 +101,6 @@ AXIS_KEY = {
     'top': lambda rc: (rc[0], rc[1]),
     'bottom': lambda rc: (-rc[0], rc[1]),
 }
-# The coordinate an ordering "from the {side}" is read off, and therefore the
-# one an ordinal walk step must cite.
-ORDINAL_AXIS = {'left': 'col', 'right': 'col', 'top': 'row', 'bottom': 'row'}
 
 Descriptor = Tuple[Optional[str], Optional[str]]  # (color, shape)
 
@@ -284,8 +276,7 @@ EMPTY_STEP = re.compile(rf"no (?:({SIZE}) )?(?:({_COLOR_ALT}) )?({_NOUN_ALT}) fo
 CMP_STEP = re.compile(r"(\d+) (greater than|less than|equal to) (\d+)$")
 PARITY_STEP = re.compile(r"(\d+) is (even|odd)$")
 DIFF_STEP = re.compile(r"difference is (\d+)$")
-ORDINAL_STEP = re.compile(
-    rf"({ORD}) from ({SIDE}) is ({SHAPE_ALT}) at (row|col) (\d)$")
+ORDINAL_STEP = re.compile(rf"({ORD}) from ({SIDE}) is ({SHAPE_ALT})$")
 PLAIN_STEPS = {'found', 'none found', AMBIGUOUS_MARKER}
 
 
@@ -393,34 +384,18 @@ class Cursor:
         if int(m.group(1)) != abs(a - b):
             raise SampleError(f"stated difference {m.group(1)} != |{a} - {b}|")
 
-    def take_ordinal_step(self, ordinal: str, side: str, obj: Dict[str, Any]):
-        """Consume one step of the ordinal sorted walk; it must name `obj`.
-
-        `obj` is whatever the independently recomputed axis order puts at this
-        rank, so a walk whose steps agree with each other -- and with the answer
-        they lead to -- still fails here if the order it walks is not the true
-        one. The cited coordinate is checked too, against the axis the queried
-        side is measured on and the object's own quantized cell.
-        """
+    def take_ordinal(self, ordinal: str, side: str, shape: str):
         step = self.take()
         m = ORDINAL_STEP.fullmatch(step)
         if not m:
-            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shape}} at "
-                              f"{{row|col}} {{n}}', got {step!r}")
+            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shape}}', "
+                              f"got {step!r}")
         if m.group(1) != ordinal or m.group(2) != side:
             raise SampleError(f"step {step!r} answers a different question than "
                               f"{ordinal!r} from {side!r}")
-        if m.group(3) != obj['shape']:
+        if m.group(3) != shape:
             raise SampleError(f"step {step!r} names {m.group(3)!r}, the {ordinal} "
-                              f"from the {side} is a {obj['shape']} at {cell(obj)}")
-        axis = ORDINAL_AXIS[side]
-        if m.group(4) != axis:
-            raise SampleError(f"step {step!r} cites a {m.group(4)}, an ordering from "
-                              f"the {side} is read off the {axis}")
-        want = cell(obj)[0 if axis == 'row' else 1]
-        if int(m.group(5)) != want:
-            raise SampleError(f"step {step!r} cites {axis} {m.group(5)}, but the "
-                              f"object it names sits at {axis} {want}")
+                              f"from the {side} is a {shape}")
 
     def take_comparison(self, a: int, b: int):
         step = self.take()
@@ -652,16 +627,6 @@ def check_count_difference(q, a, r, meta):
 
 
 def check_ordinal(q, a, r, meta):
-    """'what shape is third from the left'.
-
-    Two independent passes over the trace. The enumeration must list the whole
-    scene in raster order -- the same listing every other type emits, so nothing
-    about this type asks the model to read an object list a second way. The
-    sorted walk is then checked rank by rank against an axis order recomputed
-    here from the quantized cells, not read off the enumeration: a walk that
-    skips, reorders or invents a rank fails even when every one of its steps
-    names a real object and the answer follows from the last of them.
-    """
     m = parse_question('ordinal', q)
     ordinal, side = m.group(1), m.group(2)
     rank = ORDINAL_RANK[ordinal]
@@ -673,13 +638,12 @@ def check_ordinal(q, a, r, meta):
     if rank > len(meta):
         raise SampleError(f"asked for the {ordinal} object of a {len(meta)}-object scene")
 
-    cur = Cursor(r)
-    cur.enumerate_set(sorted(meta, key=cell), plural_of('shape'))
     ordered = axis_order(meta, side)
-    for i in range(rank):
-        cur.take_ordinal_step(ORDINAL_WORDS[i], side, ordered[i])
-    cur.expect_end()
+    cur = Cursor(r)
+    cur.enumerate_set(ordered, plural_of('shape'))
     truth = ordered[rank - 1]['shape']
+    cur.take_ordinal(ordinal, side, truth)
+    cur.expect_end()
     if a != truth:
         raise SampleError(f"answer {a!r} != ground truth {truth!r}")
 

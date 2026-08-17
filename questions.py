@@ -19,7 +19,7 @@ Trace conventions
 * count difference:      ``difference is {d}``
 * chain resolution:      ``qualifying {desc} at row {r} col {c}``
                          then ``found`` (yes) or ``none found`` (no)
-* ordinal walk step:     ``{ordinal} from {side} is {shape} at {row|col} {v}``
+* ordinal:               ``{ordinal} from {side} is {shape}``
 * unresolvable referent: ``ambiguous`` (answer ``which {desc}``)
 * correction:            ``wait`` (see inject_correction)
 
@@ -222,20 +222,6 @@ def axis_sorted(objs: Sequence[Dict[str, Any]], side: str) -> List[Dict[str, Any
     return sorted(objs, key=lambda m: key(cell_of(m)))
 
 
-# The coordinate an ordering "from the {side}" is read off: columns for the
-# vertical edges, rows for the horizontal ones. Ordinal walk steps cite it, so
-# every step of the sort is grounded in a number the enumeration also states.
-ORDINAL_AXIS: Dict[str, str] = {
-    'left': 'col', 'right': 'col', 'top': 'row', 'bottom': 'row',
-}
-
-
-def axis_value(m: Dict[str, Any], side: str) -> int:
-    """The coordinate that places an object in the ordering from `side`."""
-    row, col = cell_of(m)
-    return row if ORDINAL_AXIS[side] == 'row' else col
-
-
 def all_cells_distinct(objs: Sequence[Dict[str, Any]]) -> bool:
     """True iff no two objects share a quantized cell (ordering is then total)."""
     cells = [cell_of(m) for m in objs]
@@ -299,17 +285,6 @@ def witness_step(a: Dict[str, Any], b: Dict[str, Any], relation: str) -> str:
     if relation in ('above', 'below'):
         return f"row {ra} is {relation} row {rb}"
     return f"col {ca} is {relation} col {cb}"
-
-
-def ordinal_step(ordinal: str, side: str, m: Dict[str, Any]) -> str:
-    """One step of the ordinal sorted walk, citing the coordinate that grounds it.
-
-    Deliberately *not* an enumeration item: the ordinal walk revisits objects the
-    enumeration has already listed, and inject_correction must corrupt only the
-    perceptual claims (see ENUM_FACT, which this wording does not match).
-    """
-    return (f"{ordinal} from {side} is {m['shape']} "
-            f"at {ORDINAL_AXIS[side]} {axis_value(m, side)}")
 
 
 def _fits(candidate: Tuple[str, str, str]) -> bool:
@@ -1038,16 +1013,8 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_ordinal_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'what shape is third from the left' -- enumerate the whole scene in
-        raster order, then walk the sort order as far as the question asks.
-
-        The enumeration is the plain raster-order listing every other type emits.
-        The ordering the question is really about is a separate, explicit
-        reasoning step: one line per rank, up to the queried one, each naming the
-        object and the coordinate that puts it there. Enumerating along the axis
-        instead -- what this type used to do -- made ordinal the only type whose
-        object list was not in raster order, so the model had to infer which
-        convention a trace was following before it could read it.
+        """'what shape is third from the left' -- enumerate along the axis, then
+        read off the k-th object.
 
         Declines whenever two objects share a cell: the ordering along the axis
         would not be total and the question would have no defined answer.
@@ -1057,12 +1024,11 @@ class RationaleGenerator:
 
         k = random.randint(1, min(len(ORDINALS), len(metadata_list)))
         side = random.choice(SIDES)
-
-        steps = enumeration_steps(raster_sorted(metadata_list),
-                                  f"no {pluralize(GENERIC_NOUN)} found")
         ordered = axis_sorted(metadata_list, side)
-        steps += [ordinal_step(ORDINALS[i], side, ordered[i]) for i in range(k)]
+
+        steps = enumeration_steps(ordered, f"no {pluralize(GENERIC_NOUN)} found")
         target = ordered[k - 1]
+        steps.append(f"{ORDINALS[k - 1]} from {side} is {target['shape']}")
 
         candidate = (f"what shape is {ORDINALS[k - 1]} from the {side}",
                      target['shape'],
