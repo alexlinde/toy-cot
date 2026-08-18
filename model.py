@@ -349,7 +349,7 @@ class ToyVLM(nn.Module):
 
 
 @torch.no_grad()
-def generate_response(model, image, question, max_length=80, return_rationale=True,
+def generate_response(model, image, question, max_length=160, return_rationale=True,
                       temperature=0.0):
     """Two-stage decoding with special tokens banned from free generation.
 
@@ -445,7 +445,7 @@ def generate_response(model, image, question, max_length=80, return_rationale=Tr
 
 @torch.no_grad()
 def generate_response_self_consistent(model, image, question, k=5, temperature=0.7,
-                                      max_length=80):
+                                      max_length=160):
     """Self-consistency decoding: sample k diverse chains, majority-vote the answer.
 
     Rationale stages are sampled at `temperature` to diversify the chains; each

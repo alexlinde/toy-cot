@@ -71,8 +71,10 @@ from shapes import MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator
 from text import MAX_SEQ_LEN, NUM_IMG_TOKENS, TextProcessor
 from train_model import DIFFICULTIES
 
-# Per-stage decode cap, matching model.generate_response's default.
-MAX_GEN_LEN = 80
+# Per-stage decode cap, matching model.generate_response's default. Raised
+# 80 -> 160 for the run-11 rank-grouped ordinal trace, which runs to 141
+# tokens on a 12-object scene; 80 truncated 52% of those chains.
+MAX_GEN_LEN = 160
 
 # Sample dispositions, in the order the summary prints them.
 KINDS = ['exact', 'corrected', 'early_stop', 'skip_budget', 'skip_unusable']

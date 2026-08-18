@@ -42,7 +42,7 @@ class VLMEvaluator:
 
     def __init__(self, model: ToyVLM, text_processor: TextProcessor,
                  self_consistency_k: int = 1, temperature: float = 0.0,
-                 max_gen_len: int = 80):
+                 max_gen_len: int = 160):
         self.model = model
         self.text_processor = text_processor
         self.shape_gen = ShapeGenerator()
@@ -399,7 +399,7 @@ def parse_args() -> argparse.Namespace:
                         help='k chains with majority vote (1 = single chain)')
     parser.add_argument('--temperature', type=float, default=0.7,
                         help='rationale sampling temperature; only used when k > 1')
-    parser.add_argument('--max_gen_len', type=int, default=80,
+    parser.add_argument('--max_gen_len', type=int, default=160,
                         help='max tokens per decode stage (old default 35 truncated long chains)')
     return parser.parse_args()
 
