@@ -3,7 +3,7 @@ Interactive Tkinter GUI for the Toy VLM.
 
 Generates random multi-shape RGB scenes, lets you ask questions about them,
 and displays both the model's chain-of-thought rationale and its final
-answer, alongside the scene's ground-truth object metadata.
+answer.
 """
 
 import argparse
@@ -19,7 +19,7 @@ import torch
 from PIL import Image, ImageTk
 
 from model import ToyVLM, generate_response
-from shapes import MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator, grid_col, grid_row
+from shapes import MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator
 from text import TextProcessor
 
 CANVAS_SCALE = 4  # 64x64 scene -> 256x256 display
@@ -168,7 +168,7 @@ class ToyVLMGUI:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Left panel: scene image, new-scene button, ground-truth metadata.
+        # Left panel: scene image, new-scene button, seed entry.
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
@@ -187,12 +187,6 @@ class ToyVLMGUI:
         self.seed_entry.pack(side=tk.LEFT, padx=(0, 5))
         self.seed_entry.bind('<Return>', self.on_load_seed_pressed)
         ttk.Button(seed_frame, text="Load Seed", command=self.load_seed).pack(side=tk.LEFT)
-
-        ttk.Label(left_frame, text="Ground-truth objects:").pack(anchor='w')
-        self.metadata_display = scrolledtext.ScrolledText(
-            left_frame, height=14, width=34, wrap=tk.WORD, state='disabled'
-        )
-        self.metadata_display.pack(fill=tk.BOTH, expand=False)
 
         # Right panel: chat history + question entry.
         right_frame = ttk.Frame(main_frame)
@@ -260,7 +254,10 @@ class ToyVLMGUI:
             self.shape_generator, seed
         )
         self.update_canvas_display()
-        self.update_metadata_display()
+        # Mirror the scene's seed into the entry, so a freshly drawn one can be
+        # copied and shared without retyping it from the title bar.
+        self.seed_entry.delete(0, tk.END)
+        self.seed_entry.insert(0, str(self.current_seed))
         self.root.title(f"Toy Vision-Language Model - seed: {self.current_seed}")
 
     def load_seed(self):
@@ -285,18 +282,6 @@ class ToyVLMGUI:
         self.photo = ImageTk.PhotoImage(pil_img)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor='nw')
-
-    def update_metadata_display(self):
-        """Show the seed, then ground-truth shape/color/size/cell info for each object."""
-        self.metadata_display.config(state='normal')
-        self.metadata_display.delete('1.0', tk.END)
-        self.metadata_display.insert(tk.END, f"seed: {self.current_seed}\n\n")
-        for i, m in enumerate(self.current_metadata, start=1):
-            row, col = grid_row(m['cy']), grid_col(m['cx'])
-            self.metadata_display.insert(
-                tk.END, f"{i}. {m['size_category']} {m['color']} {m['shape']} at row {row} col {col}\n"
-            )
-        self.metadata_display.config(state='disabled')
 
     def on_enter_pressed(self, event):
         """Handle Enter key press in question entry."""
