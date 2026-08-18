@@ -11,10 +11,10 @@ sample to skip. Every fact stated in a rationale is re-parsed and checked:
 
 * each enumerated ``{color} {shape} at row r col c`` names a real object that
   really sits in that quantized cell, and the enumeration is complete and in
-  the order the question implies (raster order, or the axis order for ordinal
-  questions). Two objects may share a quantized cell, so an enumeration may
-  legitimately repeat a line -- multiplicity is checked per enumerated set (and,
-  for the ordinal axis order, per cell: objects in one cell are interchangeable
+  the order the question implies (raster order, or the ascending axis sweep for
+  ordinal questions). Two objects may share a quantized cell, so an enumeration
+  may legitimately repeat a line -- multiplicity is checked per enumerated set
+  (and, for the ordinal sweep, per cell: objects in one cell are interchangeable
   in an order defined by their coordinates);
 * every stated count equals the true count of the filtered set it claims to
   describe (including per-side counts, which is where the old generator lied);
@@ -26,8 +26,15 @@ sample to skip. Every fact stated in a rationale is re-parsed and checked:
 * an ``ordinal`` rank is recomputed here as a *dense* rank: the objects are
   bucketed by the axis coordinate the question counts along, the buckets are
   ordered from the named side, and the k-th bucket -- not the k-th object -- is
-  what the trace's closing step and the answer must name, with every distinct
-  shape it holds, deduplicated and in alphabetical order;
+  what the answer must name, with every distinct shape it holds, deduplicated
+  and in alphabetical order. The trace reaches it the long way round and every
+  leg is checked separately: the sweep is the *ascending* one whatever side is
+  asked and each of its lines carries the dense rank of its own primary-axis
+  coordinate (``rank 3 blue cross at row 2 col 3``), ``{R} ranks`` states how
+  many distinct ranks the axis really has, ``{ordinal} from {side} is rank {j}``
+  converts the queried end into the sweep's numbering, and ``rank {j} is
+  {shapes}`` reads the group off. The answer is checked against the rank counted
+  from the *queried* side, so the conversion cannot be self-consistently wrong;
 * a ``relative_count`` referent is resolved from the scene here, not read off
   the trace: one match makes the question answerable and the trace must exclude
   the referent from its own candidates, two or more make it unanswerable as
@@ -362,12 +369,22 @@ EMPTY_STEP = re.compile(rf"no (?:({SIZE}) )?(?:({_COLOR_ALT}) )?({_NOUN_ALT}) fo
 CMP_STEP = re.compile(r"(\d+) (greater than|less than|equal to) (\d+)$")
 PARITY_STEP = re.compile(r"(\d+) is (even|odd)$")
 DIFF_STEP = re.compile(r"difference is (\d+)$")
-# A tied rank names several shapes: 'third from left is circle and cross'. The
-# grammar accepts any order and any repetition -- that a list is deduplicated
-# and alphabetical is semantics, checked against the recomputed rank, not
-# something a permissive regex should quietly reject as a syntax error.
-ORDINAL_STEP = re.compile(
-    rf"({ORD}) from ({SIDE}) is ((?:{SHAPE_ALT})(?: and (?:{SHAPE_ALT}))*)$")
+# --- ordinal -------------------------------------------------------------
+# An enumeration line of the ordinal sweep, labeled with the dense rank of its
+# primary-axis coordinate. Written out here rather than reusing ENUM_STEP with
+# an optional prefix: the ordinal sweep is the only enumeration that carries a
+# label and the only one that never carries a size, and a pattern that says so
+# cannot accidentally accept a labeled `size` line or an unlabeled ordinal one.
+RANK_ENUM_STEP = re.compile(
+    rf"rank (\d+) ({_COLOR_ALT}) ({SHAPE_ALT}) at row (\d) col (\d)$")
+RANK_COUNT_STEP = re.compile(r"(\d+) ranks$")
+ORDINAL_CONV_STEP = re.compile(rf"({ORD}) from ({SIDE}) is rank (\d+)$")
+# A tied rank names several shapes: 'rank 2 is circle and cross'. The grammar
+# accepts any order and any repetition -- that a list is deduplicated and
+# alphabetical is semantics, checked against the recomputed rank, not something
+# a permissive regex should quietly reject as a syntax error.
+RANK_READOFF_STEP = re.compile(
+    rf"rank (\d+) is ((?:{SHAPE_ALT})(?: and (?:{SHAPE_ALT}))*)$")
 PLAIN_STEPS = {'found', 'none found', AMBIGUOUS_MARKER}
 
 
@@ -424,8 +441,13 @@ class Cursor:
             self.expect(f"{prefix}{m['color']} {m['shape']} at row {row} col {col}")
 
     def enumerate_ranks(self, ranks: Sequence[Sequence[Dict[str, Any]]]):
-        """Consume an ordinal enumeration: every rank in order, and inside a
-        rank every object in secondary-axis order.
+        """Consume a labeled ordinal sweep: every rank in ascending order, and
+        inside a rank every object in secondary-axis order.
+
+        `ranks` is the ascending sweep, so the rank a line must be labeled with
+        is its 1-based position in this list -- checked here as part of the line
+        itself, which is what makes a mislabeled but otherwise perfect
+        enumeration a failure.
 
         Objects sharing a quantized cell are interchangeable here -- their
         coordinates order them no further -- so a run of equal cells is matched
@@ -433,13 +455,13 @@ class Cursor:
         follows: one step is consumed per object of every rank, and a trailing
         step left over is caught by expect_end.
         """
-        for group in ranks:
+        for label, group in enumerate(ranks, start=1):
             i = 0
             while i < len(group):
                 j = i
                 while j < len(group) and cell(group[j]) == cell(group[i]):
                     j += 1
-                want = Counter(enum_line(o) for o in group[i:j])
+                want = Counter(f"rank {label} {enum_line(o)}" for o in group[i:j])
                 got = Counter(self.take() for _ in range(j - i))
                 if got != want:
                     raise SampleError(
@@ -499,8 +521,32 @@ class Cursor:
         if int(m.group(1)) != abs(a - b):
             raise SampleError(f"stated difference {m.group(1)} != |{a} - {b}|")
 
-    def take_ordinal(self, ordinal: str, side: str, shapes: Sequence[str]):
-        """The closing step must name the whole k-th rank, deduped, alphabetical.
+    def take_rank_count(self, n_ranks: int):
+        """'{R} ranks' must state the true number of distinct ranks."""
+        step = self.take()
+        m = RANK_COUNT_STEP.fullmatch(step)
+        if not m:
+            raise SampleError(f"expected 'N ranks', got {step!r}")
+        if int(m.group(1)) != n_ranks:
+            raise SampleError(f"stated {m.group(1)} ranks, the axis really has "
+                              f"{n_ranks} in step {step!r}")
+
+    def take_ordinal_conversion(self, ordinal: str, side: str, j: int):
+        """'{ordinal} from {side} is rank {j}' -- queried end onto the sweep."""
+        step = self.take()
+        m = ORDINAL_CONV_STEP.fullmatch(step)
+        if not m:
+            raise SampleError(f"expected '{{ordinal}} from {{side}} is rank {{j}}', "
+                              f"got {step!r}")
+        if m.group(1) != ordinal or m.group(2) != side:
+            raise SampleError(f"step {step!r} converts a different question than "
+                              f"{ordinal!r} from {side!r}")
+        if int(m.group(3)) != j:
+            raise SampleError(f"step {step!r} maps the {ordinal} rank from the "
+                              f"{side} onto sweep rank {m.group(3)}, it is rank {j}")
+
+    def take_rank_readoff(self, j: int, shapes: Sequence[str]):
+        """The closing step must name the whole j-th rank, deduped, alphabetical.
 
         `shapes` is the recomputed rank, so this one comparison rejects a
         dropped member, an invented one, a repeat, and a list that is merely out
@@ -508,18 +554,16 @@ class Cursor:
         exactly this order.
         """
         step = self.take()
-        m = ORDINAL_STEP.fullmatch(step)
+        m = RANK_READOFF_STEP.fullmatch(step)
         if not m:
-            raise SampleError(f"expected '{{ordinal}} from {{side}} is {{shapes}}', "
-                              f"got {step!r}")
-        if m.group(1) != ordinal or m.group(2) != side:
-            raise SampleError(f"step {step!r} answers a different question than "
-                              f"{ordinal!r} from {side!r}")
-        named = m.group(3).split(' and ')
+            raise SampleError(f"expected 'rank {{j}} is {{shapes}}', got {step!r}")
+        if int(m.group(1)) != j:
+            raise SampleError(f"step {step!r} reads off rank {m.group(1)}, the "
+                              f"conversion named rank {j}")
+        named = m.group(2).split(' and ')
         if named != list(shapes):
-            raise SampleError(f"step {step!r} names {named}, the {ordinal} rank "
-                              f"from the {side} holds {list(shapes)} (unique shapes, "
-                              f"alphabetical)")
+            raise SampleError(f"step {step!r} names {named}, rank {j} holds "
+                              f"{list(shapes)} (unique shapes, alphabetical)")
 
     def take_comparison(self, a: int, b: int):
         step = self.take()
@@ -580,6 +624,17 @@ def check_step_facts(rationale: str, meta: Sequence[Dict[str, Any]]):
     for step in rationale.split(' . '):
         if step in PLAIN_STEPS:
             continue
+        m = RANK_ENUM_STEP.fullmatch(step)
+        if m:
+            _label, color, shape, row, col = m.groups()
+            # The label claims something about the sweep, not about the scene,
+            # so it is checked where the sweep is known (Cursor.enumerate_ranks).
+            hit = [o for o in meta
+                   if o['color'] == color and o['shape'] == shape
+                   and cell(o) == (int(row), int(col))]
+            if not hit:
+                raise SampleError(f"step {step!r} describes no real object")
+            continue
         m = ENUM_STEP.fullmatch(step)
         if m:
             size, color, shape, row, col = m.groups()
@@ -603,7 +658,8 @@ def check_step_facts(rationale: str, meta: Sequence[Dict[str, Any]]):
             continue
         if any(p.fullmatch(step) for p in (WITNESS_STEP, COUNT_STEP, COUNT_OF_STEP,
                                            COUNT_SIDE_STEP, EMPTY_STEP, CMP_STEP,
-                                           PARITY_STEP, DIFF_STEP, ORDINAL_STEP)):
+                                           PARITY_STEP, DIFF_STEP, RANK_COUNT_STEP,
+                                           ORDINAL_CONV_STEP, RANK_READOFF_STEP)):
             continue
         raise SampleError(f"unrecognized rationale step {step!r}")
 
@@ -814,27 +870,46 @@ def check_ordinal(q, a, r, meta):
     so two objects in one column are one rank from the left and two ranks from
     the top. A scene with fewer distinct coordinates than the queried rank has
     no answer at all and must never have been drawn.
+
+    The truth the *answer* is held to is that rank counted from the side the
+    question names -- the semantics, unchanged by the trace format. The trace
+    walks there through the ascending sweep instead, and its three closing steps
+    are checked against ground truth one at a time, so no two of them can be
+    wrong in compensating ways: the rank count against the distinct coordinates
+    of the axis, the conversion against (side, k, R) recomputed here, and the
+    read-off against the ascending rank the conversion named. Only then is the
+    read-off required to be the queried-side truth, which is where the two
+    readings are pinned to each other.
     """
     m = parse_question('ordinal', q)
     ordinal, side = m.group(1), m.group(2)
     rank = ORDINAL_RANK[ordinal]
 
-    ranks = axis_ranks(meta, side)
-    if rank > len(ranks):
+    queried = axis_ranks(meta, side)
+    if rank > len(queried):
         raise SampleError(f"asked for the {ordinal} rank from the {side} of a scene "
-                          f"whose {len(meta)} objects occupy only {len(ranks)} "
+                          f"whose {len(meta)} objects occupy only {len(queried)} "
                           f"distinct {'row' if side in ('top', 'bottom') else 'col'} "
                           f"values")
+    truth = sorted({o['shape'] for o in queried[rank - 1]})
+
+    # The sweep is ascending whatever side was asked: columns left to right for
+    # a left/right question, rows top to bottom for a top/bottom one.
+    ascending = axis_ranks(meta, 'left' if side in ('left', 'right') else 'top')
+    n_ranks = len(ascending)
+    j = rank if side in ('left', 'top') else n_ranks - rank + 1
 
     cur = Cursor(r)
-    cur.enumerate_ranks(ranks)
-    truth = sorted({o['shape'] for o in ranks[rank - 1]})
-    cur.take_ordinal(ordinal, side, truth)
+    cur.enumerate_ranks(ascending)
+    cur.take_rank_count(n_ranks)
+    cur.take_ordinal_conversion(ordinal, side, j)
+    cur.take_rank_readoff(j, truth)
     cur.expect_end()
     want = ' and '.join(truth)
     if a != want:
         raise SampleError(f"answer {a!r} != ground truth {want!r} (rank {rank} from "
-                          f"the {side} holds {len(ranks[rank - 1])} objects)")
+                          f"the {side}, sweep rank {j} of {n_ranks}, holds "
+                          f"{len(queried[rank - 1])} objects)")
 
 
 def check_relative_count(q, a, r, meta):
@@ -975,10 +1050,25 @@ YES_NO_TYPES = set(CHECKERS) - OPEN_ANSWER_TYPES
 # Error-injected correction traces (--correction_p)
 # ---------------------------------------------------------------------------
 
+def split_rank_label(step: str) -> Tuple[Optional[str], str]:
+    """Split an ordinal enumeration line into its rank label and the bare fact.
+
+    Returns ``(None, step)`` for every other step, so everything below stays
+    written against the unlabeled ENUM_STEP grammar. The label is a claim about
+    the sweep and is compared separately (an injected error must change exactly
+    one *attribute*, never the label).
+    """
+    m = RANK_ENUM_STEP.fullmatch(step)
+    if not m:
+        return None, step
+    return m.group(1), step[len(f"rank {m.group(1)} "):]
+
+
 def enum_matches(step: str, meta: Sequence[Dict[str, Any]],
                  ignore_size: bool = False) -> List[Dict[str, Any]]:
     """Objects the enumeration `step` could be describing (may be empty)."""
-    m = ENUM_STEP.fullmatch(step)
+    _label, fact = split_rank_label(step)
+    m = ENUM_STEP.fullmatch(fact)
     if not m:
         raise SampleError(f"step {step!r} is not an enumeration fact")
     size, color, shape, row, col = m.groups()
@@ -989,7 +1079,8 @@ def enum_matches(step: str, meta: Sequence[Dict[str, Any]],
 
 
 def fact_fields(step: str) -> Tuple[Optional[str], str, str, int, int]:
-    m = ENUM_STEP.fullmatch(step)
+    _label, fact = split_rank_label(step)
+    m = ENUM_STEP.fullmatch(fact)
     if not m:
         raise SampleError(f"step {step!r} is not an enumeration fact")
     size, color, shape, row, col = m.groups()
@@ -1062,6 +1153,11 @@ def check_correction(qtype: str, question: str, answer: str, rationale: str,
     if enum_matches(corrupted, meta, ignore_size=True):
         raise SampleError(f"corrupted step {corrupted!r} still matches an object "
                           f"in the scene: it is not an error")
+    wrong_label, _ = split_rank_label(corrupted)
+    true_label, _ = split_rank_label(correction)
+    if wrong_label != true_label:
+        raise SampleError(f"corruption changed the rank label: {corrupted!r} "
+                          f"corrects to {correction!r}")
     wrong_fields = fact_fields(corrupted)
     true_fields = fact_fields(correction)
     differing = [name for name, w, t in zip(('size', 'color', 'shape', 'row', 'col'),

@@ -19,8 +19,15 @@ Trace conventions
 * count difference:      ``difference is {d}``
 * chain resolution:      ``qualifying {desc} at row {r} col {c}``
                          then ``found`` (yes) or ``none found`` (no)
-* ordinal:               ``{ordinal} from {side} is {shape}``
-                         / ``{ordinal} from {side} is {shape} and {shape}``
+* ordinal enumeration:   ``rank {label} {color} {shape} at row {r} col {c}``
+                         (always the ascending sweep; `label` is the dense rank
+                         of the line's primary-axis coordinate, so tied objects
+                         carry the same label)
+* ordinal ranking:       ``{R} ranks`` -- how many distinct ranks the sweep found
+* ordinal conversion:    ``{ordinal} from {side} is rank {j}`` -- j = k counting
+                         from left/top, R - k + 1 from right/bottom
+* ordinal read-off:      ``rank {j} is {shape}``
+                         / ``rank {j} is {shape} and {shape}``
                          (a tied rank names every distinct shape it holds)
 * unresolvable referent: ``ambiguous`` (answer ``which {desc}``)
 * correction:            ``wait`` (see inject_correction)
@@ -104,6 +111,11 @@ TEMPLATE_WORDS = frozenset({
     # tokenizer's vocabulary is unchanged by them.
     'at', 'row', 'col', 'count', 'of', 'no', 'none', 'found', 'qualifying',
     'greater', 'less', 'equal', 'to', 'even', 'odd',
+    # the rank-grouped ordinal trace: 'rank 3 blue cross at row 2 col 3',
+    # '4 ranks', 'fourth from right is rank 1', 'rank 1 is square'. These two
+    # are the only words this trace format added (see RANK_WORD / RANKS_WORD,
+    # which vocabulary() names again so the format stands on its own).
+    'rank', 'ranks',
     # answers
     'yes',
 })
@@ -337,6 +349,20 @@ AXIS_KEY: Dict[str, Callable[[Tuple[int, int]], Tuple[int, int]]] = {
 # Which coordinate of (row, col) the rank counts along, per side.
 PRIMARY_AXIS: Dict[str, int] = {'left': 1, 'right': 1, 'top': 0, 'bottom': 0}
 
+# The side whose AXIS_KEY sweeps the queried axis *ascending*. An ordinal trace
+# enumerates in this order whatever side the question names -- 'left' for the
+# column axis, 'top' for the row axis -- so the sweep is always the raster-ish
+# one every other question type already trains, and no reversed sweep is ever
+# generated. Which end of that sweep the question counts from is then a
+# conversion step, not a re-sort (see ascending_rank).
+SWEEP_SIDE: Dict[str, str] = {'left': 'left', 'right': 'left',
+                              'top': 'top', 'bottom': 'top'}
+
+# The word the ordinal trace ranks with, singular and plural. Both are the only
+# vocabulary this trace format adds.
+RANK_WORD = 'rank'
+RANKS_WORD = 'ranks'
+
 # Joins the shape names of a tied ordinal rank ('circle and cross').
 GROUP_JOINER = ' and '
 
@@ -385,9 +411,50 @@ def group_text(group: Sequence[Dict[str, Any]]) -> str:
     return GROUP_JOINER.join(group_shapes(group))
 
 
-def ordinal_step(ordinal: str, side: str, group: Sequence[Dict[str, Any]]) -> str:
-    """The closing step of an ordinal trace, naming the whole k-th rank."""
-    return f"{ordinal} from {side} is {group_text(group)}"
+def ascending_rank(side: str, k: int, n_ranks: int) -> int:
+    """Which ascending-sweep rank the k-th rank from `side` is.
+
+    The sweep runs low-to-high on the queried axis, so counting from the left or
+    the top is already the sweep's own numbering; counting from the right or the
+    bottom mirrors it.
+    """
+    return k if side in ('left', 'top') else n_ranks - k + 1
+
+
+def rank_enumeration_steps(groups: Sequence[Sequence[Dict[str, Any]]]) -> List[str]:
+    """The ascending sweep, every line labeled with its dense rank.
+
+    The label is written 'rank {n}' rather than as a bare digit: a bare leading
+    digit reads as a count ('1 blue square'), and spelling it this way makes the
+    read-off step's 'rank {j}' a literal repeat of the label it must retrieve.
+    """
+    steps: List[str] = []
+    for label, group in enumerate(groups, start=1):
+        for m in group:
+            row, col = cell_of(m)
+            steps.append(f"{RANK_WORD} {label} {m['color']} {m['shape']} "
+                         f"at row {row} col {col}")
+    return steps
+
+
+def rank_count_step(n_ranks: int) -> str:
+    """'4 ranks' -- how many distinct ranks the sweep found.
+
+    Always plural, including the degenerate '1 ranks': the step is a count in a
+    fixed two-token shape, not a sentence, and a singular special case would buy
+    grammar at the price of a second surface form to learn.
+    """
+    return f"{n_ranks} {RANKS_WORD}"
+
+
+def ordinal_conversion_step(ordinal: str, side: str, j: int) -> str:
+    """'fourth from right is rank 1' -- the queried end mapped onto the sweep."""
+    return f"{ordinal} from {side} is {RANK_WORD} {j}"
+
+
+def rank_readoff_step(j: int, group: Sequence[Dict[str, Any]]) -> str:
+    """'rank 1 is square' -- the whole j-th rank of the sweep, deduped."""
+    return f"{RANK_WORD} {j} is {group_text(group)}"
 
 
 def relation_holds(a: Dict[str, Any], b: Dict[str, Any], relation: str) -> bool:
@@ -488,10 +555,11 @@ CORRUPT_COORD_MAX = 6
 CORRECTION_ATTEMPTS = 10
 
 # Words the insertion may add: the corrupted fact (7 words, 8 with a size
-# prefix), the marker `wait`, and the two ' . ' separators that frame it -- 11
-# at most. WORD_BUDGET guarantees a fitting sample *without* the insertion, so
-# inject_correction declines whenever the base draw is within this reserve of
-# the budget. The margin (16 - 11) is slack, not a second budget.
+# prefix, 9 with an ordinal line's 'rank {n}' label), the marker `wait`, and the
+# two ' . ' separators that frame it -- 13 at most (11 before the labeled
+# ordinal format). WORD_BUDGET guarantees a fitting sample *without* the
+# insertion, so inject_correction declines whenever the base draw is within this
+# reserve of the budget. The margin (16 - 13) is slack, not a second budget.
 CORRECTION_RESERVE = 16
 
 # WORD_BUDGET bounds question + answer + rationale together, and the longest
@@ -515,8 +583,14 @@ QUESTION_RESERVE = 32
 _SIZE_ALT = '|'.join(SIZE_NAMES)
 _COLOR_ALT = '|'.join(COLOR_NAMES)
 _SHAPE_ALT = '|'.join(SHAPE_NAMES)
-# Enumeration fact, with the optional size prefix used by the `size` type.
+# Enumeration fact, with the optional size prefix used by the `size` type and
+# the optional 'rank {n}' label used by the ordinal type. The label is *not*
+# part of the fact: parse_fact and fact_text speak the bare fact, and
+# inject_correction splits the label off before corrupting and puts the same
+# label back, so a corrupted ordinal line stays in the format its neighbours are
+# in and the only thing that differs about it is the attribute that was changed.
 ENUM_FACT = re.compile(
+    rf"(?:{RANK_WORD} (?P<label>\d) )?"
     rf"(?:(?P<size>{_SIZE_ALT}) )?(?P<color>{_COLOR_ALT}) (?P<shape>{_SHAPE_ALT})"
     rf" at row (?P<row>\d) col (?P<col>\d)")
 
@@ -535,19 +609,38 @@ def join_steps(steps: Sequence[str]) -> str:
 
 
 def fact_text(fact: Fact) -> str:
-    """Render an enumeration fact back into its trace step."""
+    """Render an enumeration fact back into its trace step (no rank label)."""
     size, color, shape, row, col = fact
     prefix = f"{size} " if size is not None else ''
     return f"{prefix}{color} {shape} at row {row} col {col}"
 
 
 def parse_fact(step: str) -> Optional[Fact]:
-    """Parse an enumeration step, or None if the step is not one."""
+    """Parse an enumeration step, or None if the step is not one.
+
+    An ordinal line's 'rank {n}' label is accepted and ignored: what a fact
+    asserts about the scene is the object and its cell, and the label is a claim
+    about the sweep instead (validate_traces checks it against the recomputed
+    dense rank). Use split_label when the label itself matters.
+    """
     m = ENUM_FACT.fullmatch(step)
     if m is None:
         return None
     return (m.group('size'), m.group('color'), m.group('shape'),
             int(m.group('row')), int(m.group('col')))
+
+
+def split_label(step: str) -> Tuple[str, str]:
+    """Split an enumeration step into its rank label ('' if none) and the fact.
+
+    ``'rank 3 blue cross at row 2 col 3'`` -> ``('rank 3 ', 'blue cross at row
+    2 col 3')``; the two pieces concatenate back to the step exactly.
+    """
+    m = ENUM_FACT.fullmatch(step)
+    if m is None or m.group('label') is None:
+        return '', step
+    prefix = f"{RANK_WORD} {m.group('label')} "
+    return prefix, step[len(prefix):]
 
 
 def corruption_options(fact: Fact) -> List[Fact]:
@@ -623,7 +716,8 @@ def inject_correction(rationale: str, metadata_list: Sequence[Dict[str, Any]],
         return None
 
     index = rng.choice(candidates)
-    original = parse_fact(steps[index])
+    label, fact_step = split_label(steps[index])
+    original = parse_fact(fact_step)
     options = corruption_options(original)
     if not options:
         return None
@@ -641,7 +735,7 @@ def inject_correction(rationale: str, metadata_list: Sequence[Dict[str, Any]],
     # it owns, so the concatenation is exactly the original token stream with
     # `{corrupted} . wait . ` spliced in front of the corrupted step's original.
     prefix = ''.join(step + STEP_SEP for step in steps[:index])
-    corrupted_text = fact_text(corrupted)
+    corrupted_text = label + fact_text(corrupted)
     tail = join_steps([CORRECTION_MARKER] + steps[index:])
     segments = [(prefix, True), (corrupted_text, False), (STEP_SEP + tail, True)]
     segments = [(text, supervised) for text, supervised in segments if text]
@@ -1277,15 +1371,43 @@ class RationaleGenerator:
     # ------------------------------------------------------------------
 
     def generate_ordinal_qa(self, metadata_list: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        """'what shape is third from the left' -- enumerate along the axis, then
-        name the k-th *rank*. Also asked as 'which shape is ...' and 'what is
-        the third shape from the ...'.
+        """'what shape is third from the left' -- sweep once, rank, then read off.
 
-        Ranking is dense (see axis_groups): objects sharing the queried axis
-        coordinate share a rank, and a shared rank answers with every distinct
-        shape on it ('circle and cross'). A scene whose objects all sit on
-        different columns therefore behaves exactly as it did under the old
-        one-object-per-rank reading.
+        Also asked as 'which shape is ...' and 'what is the third shape from the
+        ...'; the question surface is unchanged, the trace is not.
+
+        Four steps, and each one is a separate thing that can be checked:
+
+        1. the enumeration, ALWAYS in the ascending sweep of the queried axis
+           (columns left-to-right, rows top-to-bottom) whatever side the question
+           names, every line labeled with the dense rank of its primary-axis
+           coordinate: ``rank 3 blue cross at row 2 col 3``. Tied objects share a
+           label. The label is written 'rank {n}' and not as a bare digit,
+           because a leading bare digit reads as a count and because the
+           read-off step then retrieves its rank by matching the very bigram the
+           enumeration wrote;
+        2. ``{R} ranks`` -- how many distinct ranks the sweep found;
+        3. ``{ordinal} from {side} is rank {j}`` -- the conversion from the end
+           the question counts from to the sweep's own numbering (j = k from the
+           left/top, R - k + 1 from the right/bottom);
+        4. ``rank {j} is {shapes}`` -- the read-off, every distinct shape on that
+           rank, deduplicated and alphabetical.
+
+        This replaces run 10's format, which sorted the enumeration from the
+        queried side and closed with one '{ordinal} from {side} is {shapes}'
+        step. Probing that checkpoint (probe_ordinal.py) showed the reversed
+        sweeps were where the axis sort broke -- the ascending 'top' sweep had a
+        0.00 order-error rate against 0.53/0.34/0.28 for right/bottom/left --
+        and that 15% of failures came after a *perfect* enumeration, on the
+        implicit grouping and read-off. Both are now explicit text: there is one
+        sweep direction to learn, and the grouping the answer is read off is
+        written down rather than recounted in the model's head.
+
+        The answer is unchanged: it is still the dense rank counted from the
+        queried side (see axis_groups), which rank {j} of the ascending sweep is
+        exactly. Ranking is dense, so objects sharing the queried axis coordinate
+        share a rank and a shared rank answers with every distinct shape on it
+        ('circle and cross').
 
         Declines when the scene offers fewer ranks than the drawn one -- a
         four-object scene stacked in two columns has no third from the left.
@@ -1295,21 +1417,29 @@ class RationaleGenerator:
 
         k = random.randint(1, min(len(ORDINALS), len(metadata_list)))
         side = random.choice(SIDES)
-        groups = axis_groups(metadata_list, side)
-        if k > len(groups):
+        # Ranks are counted along the queried axis, so their number does not
+        # depend on which end the question counts from; the sweep is the
+        # ascending one either way.
+        groups = axis_groups(metadata_list, SWEEP_SIDE[side])
+        n_ranks = len(groups)
+        if k > n_ranks:
             return None, None, None
 
-        ordered = [m for group in groups for m in group]  # == axis_sorted(...)
-        steps = enumeration_steps(ordered, f"no {pluralize(GENERIC_NOUN)} found")
-        steps.append(ordinal_step(ORDINALS[k - 1], side, groups[k - 1]))
-
+        j = ascending_rank(side, k, n_ranks)
         ordinal = ORDINALS[k - 1]
+        target = groups[j - 1]
+
+        steps = rank_enumeration_steps(groups)
+        steps.append(rank_count_step(n_ranks))
+        steps.append(ordinal_conversion_step(ordinal, side, j))
+        steps.append(rank_readoff_step(j, target))
+
         question = phrase(
             f"what shape is {ordinal} from the {side}",
             f"which shape is {ordinal} from the {side}",
             f"what is the {ordinal} {GENERIC_NOUN} from the {side}",
         )
-        candidate = (question, group_text(groups[k - 1]), ' . '.join(steps))
+        candidate = (question, group_text(target), ' . '.join(steps))
         return candidate if _fits(candidate) else (None, None, None)
 
     # ------------------------------------------------------------------
@@ -1490,11 +1620,14 @@ class RationaleGenerator:
         for comparison in COMPARISON_PHRASES.values():
             words.update(comparison.split())
 
-        # ordinals ('what shape is third from the left') and the joiner that
-        # binds a tied rank's shapes ('circle and cross'). 'and' is a template
-        # word too; naming it here as well keeps the trace format's vocabulary
-        # standing on its own.
+        # ordinals ('what shape is third from the left'), the words the trace
+        # ranks with ('rank 3 blue cross at row 2 col 3', '4 ranks') and the
+        # joiner that binds a tied rank's shapes ('circle and cross'). All three
+        # are template words too; naming them here as well keeps the trace
+        # format's vocabulary standing on its own.
         words.update(ORDINALS)
+        words.add(RANK_WORD)
+        words.add(RANKS_WORD)
         words.update(GROUP_JOINER.split())
 
         # numbers: grid coordinates 0-7 and single digits, plus every count /
