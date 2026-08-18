@@ -98,6 +98,7 @@ def main():
     kinds = Counter()
     by_n = defaultdict(Counter)
     tie_split = defaultdict(Counter)
+    by_side = defaultdict(Counter)
     step_errs = Counter()   # samples whose enumeration diverged, per bucket
     step_tot = Counter()    # enumeration steps generated before divergence
 
@@ -145,6 +146,14 @@ def main():
         tie_split[key]['n'] += 1
         tie_split[key]['acc'] += hit
 
+        # Per-side split: 'top' enumeration coincides with raster order (the
+        # sweep every other question type trains), 'bottom'/'right' are
+        # reversed sweeps only ordinal exercises -- order failures piling up
+        # there would be sweep-direction difficulty, not ranking difficulty.
+        by_side[side]['n'] += 1
+        by_side[side]['acc'] += hit
+        by_side[side]['order_err'] += int(kind == 'order')
+
     total_acc = sum(c['acc'] for c in by_n.values()) / got
     print(f"\nn={got}  answer EM overall: {total_acc:.3f}\n")
     print("first-divergence class:")
@@ -162,6 +171,13 @@ def main():
     print("\ntarget rank: " + '  '.join(
         f"{k}: {v['acc'] / v['n']:.2f} (n={v['n']})"
         for k, v in sorted(tie_split.items())))
+
+    print("\nby side: accuracy | order-error share")
+    for side in ('top', 'bottom', 'left', 'right'):
+        c = by_side[side]
+        if c['n']:
+            print(f"  {side:>6}: acc {c['acc'] / c['n']:.2f}"
+                  f"  order-err {c['order_err'] / c['n']:.2f}  (n={c['n']})")
 
 
 if __name__ == "__main__":
