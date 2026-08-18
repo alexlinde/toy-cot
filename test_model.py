@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageTk
 
-from model import ToyVLM, generate_response
+from model import ToyVLM, generate_response, read_aux_counts
 from shapes import MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator
 from text import TextProcessor
 
@@ -188,12 +188,29 @@ class ToyVLMGUI:
         self.seed_entry.bind('<Return>', self.on_load_seed_pressed)
         ttk.Button(seed_frame, text="Load Seed", command=self.load_seed).pack(side=tk.LEFT)
 
+        # Inner-state panel: the auxiliary count heads' readout of the current
+        # image -- what the encoder believes before any reasoning happens.
+        ttk.Label(left_frame, text="Encoder counts (aux heads):").pack(anchor='w')
+        self.perception_display = scrolledtext.ScrolledText(
+            left_frame, height=12, width=34, wrap=tk.WORD, state='disabled',
+            font=('Courier', 11)
+        )
+        self.perception_display.pack(fill=tk.BOTH, expand=False)
+
         # Right panel: chat history + question entry.
         right_frame = ttk.Frame(main_frame)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.chat_display = scrolledtext.ScrolledText(right_frame, height=22, wrap=tk.WORD, state='disabled')
         self.chat_display.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # Confidence bins for the model's chain: each emitted token is tinted by
+        # the probability the model assigned it, so hesitation is visible at the
+        # exact token where it happens (a tie's rank label, a crowded column).
+        self.chat_display.tag_configure('conf_low', background='#f4a09c')     # p < .5
+        self.chat_display.tag_configure('conf_mid', background='#f7c87f')     # .5-.8
+        self.chat_display.tag_configure('conf_high', background='#f5eba9')    # .8-.95
+        self.chat_display.tag_configure('dim', foreground='#777777')
 
         input_frame = ttk.Frame(right_frame)
         input_frame.pack(fill=tk.X, pady=(0, 5))
@@ -258,7 +275,28 @@ class ToyVLMGUI:
         # copied and shared without retyping it from the title bar.
         self.seed_entry.delete(0, tk.END)
         self.seed_entry.insert(0, str(self.current_seed))
+        self.update_perception_display()
         self.root.title(f"Toy Vision-Language Model - seed: {self.current_seed}")
+
+    def update_perception_display(self):
+        """Show the auxiliary count heads' readout of the current image.
+
+        The heads see only the vision tokens, so this is scene state, not
+        question state: it updates when the scene does, and shows what the
+        encoder believes before (and regardless of) any question. A count whose
+        head is unsure (probability < 0.6) is marked with '?'.
+        """
+        image = torch.tensor(self.current_image, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        aux = read_aux_counts(self.model, image)
+        self.perception_display.config(state='normal')
+        self.perception_display.delete('1.0', tk.END)
+        for family in ('shape', 'color', 'size'):
+            row = "  ".join(f"{name} {count}{'' if prob >= 0.6 else '?'}"
+                            for name, count, prob in aux[family])
+            self.perception_display.insert(tk.END, f"{family:<6} {row}\n")
+        self.perception_display.insert(
+            tk.END, "\n(what the encoder reads off the image,\n before any reasoning)")
+        self.perception_display.config(state='disabled')
 
     def load_seed(self):
         """Parse the seed entry and regenerate that exact scene."""
@@ -329,10 +367,37 @@ class ToyVLMGUI:
     def _process_question(self, question):
         """Run the model on the current scene and display rationale + answer."""
         image = torch.tensor(self.current_image, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        rationale, answer = generate_response(self.model, image, question)
+        rationale, answer, details = generate_response(self.model, image, question,
+                                                       return_details=True)
+        self.root.after(0, self.add_model_response, answer, details)
 
-        response = f"Reasoning: {rationale}\nAnswer: {answer}"
-        self.root.after(0, self.add_to_chat, response, "Model")
+    @staticmethod
+    def _confidence_tag(prob):
+        """The chat tag for a token probability, or None above 0.95 (no tint)."""
+        if prob < 0.5:
+            return 'conf_low'
+        if prob < 0.8:
+            return 'conf_mid'
+        if prob < 0.95:
+            return 'conf_high'
+        return None
+
+    def add_model_response(self, answer, details):
+        """Render the chain token by token, tinted by the model's confidence,
+        then the answer and its top alternatives."""
+        self.chat_display.config(state='normal')
+        self.chat_display.insert(tk.END, "[Model] Reasoning: ")
+        for word, prob in details['rationale_tokens']:
+            self.chat_display.insert(tk.END, word, self._confidence_tag(prob))
+            self.chat_display.insert(tk.END, " ")
+        self.chat_display.insert(tk.END, "\n        Answer: ")
+        for word, prob in details['answer_tokens']:
+            self.chat_display.insert(tk.END, word, self._confidence_tag(prob))
+            self.chat_display.insert(tk.END, " ")
+        alts = "  ·  ".join(f"{w} {p:.2f}" for w, p in details['answer_topk'])
+        self.chat_display.insert(tk.END, f"\n        alternatives: {alts}\n\n", 'dim')
+        self.chat_display.config(state='disabled')
+        self.chat_display.see(tk.END)
 
     def run(self):
         """Start the GUI."""

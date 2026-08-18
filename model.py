@@ -350,7 +350,7 @@ class ToyVLM(nn.Module):
 
 @torch.no_grad()
 def generate_response(model, image, question, max_length=160, return_rationale=True,
-                      temperature=0.0):
+                      temperature=0.0, return_details=False):
     """Two-stage decoding with special tokens banned from free generation.
 
     Prompt: [BOS] <IMG_START> <IMG>xN <IMG_END> <|user|> q <|assistant|> <THINK>
@@ -365,6 +365,16 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
         max_length: Maximum steps per stage (rationale/answer)
         return_rationale: If True returns (rationale, answer); else answer
         temperature: Rationale-stage sampling temperature; 0 = greedy
+        return_details: If True, returns (rationale, answer, details) where
+            details exposes the inner state the decode already computed:
+            'rationale_tokens' / 'answer_tokens' as [(word, prob), ...] with
+            prob the untempered softmax probability of the emitted token over
+            the banned-masked logits (the model's own confidence, independent
+            of the sampling temperature); 'answer_topk' as the top-3
+            [(word, prob), ...] alternatives at the first answer position; and
+            'aux' as the auxiliary count heads' readout of the image alone,
+            {'shape'|'color'|'size': [(name, count, prob), ...]} -- what the
+            encoder believes before any reasoning happens.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -392,10 +402,13 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
     }
 
     def step_once(ids, allowed_special, temp=0.0):
-        """Next token with every special token banned except allowed_special.
+        """Next token (and its untempered probability distribution) with every
+        special token banned except allowed_special.
 
         temp=0 -> greedy argmax; temp>0 -> temperature sampling (used by
-        self-consistency to diversify chains).
+        self-consistency to diversify chains). The returned distribution is
+        always the untempered softmax over the masked logits -- the model's own
+        confidence, independent of how the token was drawn.
         """
         ids_pad = model.text_processor.pad_sequence(ids, MAX_SEQ_LEN)
         ids_t = torch.tensor(ids_pad, dtype=torch.long, device=device).unsqueeze(0)
@@ -404,43 +417,100 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
         next_logits = logits[0, pos, :].clone()
         banned = [tid for tid in all_special_ids if tid != allowed_special]
         next_logits[banned] = float('-inf')
+        probs = F.softmax(next_logits, dim=-1)
         if temp > 0:
-            probs = F.softmax(next_logits / temp, dim=-1)
-            return int(torch.multinomial(probs, 1).item())
-        return int(torch.argmax(next_logits).item())
+            nxt = int(torch.multinomial(F.softmax(next_logits / temp, dim=-1), 1).item())
+        else:
+            nxt = int(torch.argmax(next_logits).item())
+        return nxt, probs
 
     rationale_tokens = []
     answer_tokens = []
+    rationale_probs = []
+    answer_probs = []
+    answer_topk = []
 
     # Stage 1: rationale until </THINK> (sampled when temperature > 0)
     for _ in range(max_length):
         if len(input_ids) >= MAX_SEQ_LEN - 4:
             break  # leave room for </THINK> <FINAL> answer </FINAL>
-        nxt = step_once(input_ids, allowed_special=tok.think_end_id, temp=temperature)
+        nxt, probs = step_once(input_ids, allowed_special=tok.think_end_id, temp=temperature)
         input_ids.append(nxt)
         if nxt == tok.think_end_id:
             break
         rationale_tokens.append(nxt)
+        rationale_probs.append(float(probs[nxt]))
     if input_ids[-1] != tok.think_end_id:
         input_ids.append(tok.think_end_id)
 
     input_ids.append(tok.final_start_id)
 
     # Stage 2: answer until </FINAL>
-    for _ in range(max_length):
+    for step in range(max_length):
         if len(input_ids) >= MAX_SEQ_LEN - 1:
             break
-        nxt = step_once(input_ids, allowed_special=tok.final_end_id)
+        nxt, probs = step_once(input_ids, allowed_special=tok.final_end_id)
+        if return_details and step == 0:
+            # Top alternatives at the first answer position: for the one-word
+            # answers most types produce, this is the whole answer's
+            # distribution; for multi-word answers it is the opening word's.
+            top = torch.topk(probs, k=min(4, probs.shape[0]))
+            answer_topk = [(tok.decode([int(i)], skip_special_tokens=True), float(p))
+                           for p, i in zip(top.values, top.indices)
+                           if int(i) not in all_special_ids][:3]
         input_ids.append(nxt)
         if nxt == tok.final_end_id:
             break
         answer_tokens.append(nxt)
+        answer_probs.append(float(probs[nxt]))
     if input_ids[-1] != tok.final_end_id:
         input_ids.append(tok.final_end_id)
 
     rationale = tok.decode(rationale_tokens, skip_special_tokens=True)
     answer = tok.decode(answer_tokens, skip_special_tokens=True)
+    if return_details:
+        details = {
+            'rationale_tokens': [
+                (tok.decode([t], skip_special_tokens=True), p)
+                for t, p in zip(rationale_tokens, rationale_probs)],
+            'answer_tokens': [
+                (tok.decode([t], skip_special_tokens=True), p)
+                for t, p in zip(answer_tokens, answer_probs)],
+            'answer_topk': answer_topk,
+            'aux': read_aux_counts(model, image),
+        }
+        return rationale, answer, details
     return (rationale, answer) if return_rationale else answer
+
+
+@torch.no_grad()
+def read_aux_counts(model, image):
+    """The auxiliary count heads' readout of an image: the encoder's belief
+    before any reasoning happens.
+
+    Every training forward computes these heads and inference normally discards
+    them; here they are read directly off the vision tokens (no text input is
+    involved). Returns {'shape'|'color'|'size': [(name, count, prob), ...]}
+    where count is each head's argmax class and prob its softmax probability.
+
+    Args:
+        image: RGB tensor (3, 64, 64), float32 in [0,1].
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    img_tokens = model.encode_image_tokens(image.to(device).unsqueeze(0))
+    aux = model.auxiliary_heads(img_tokens)
+    families = {'shape': aux['count_logits'], 'size': aux['size_count_logits'],
+                'color': aux['color_count_logits']}
+    out = {}
+    for family, heads in families.items():
+        rows = []
+        for name, logits in heads.items():
+            probs = F.softmax(logits[0], dim=-1)
+            count = int(torch.argmax(probs).item())
+            rows.append((name, count, float(probs[count])))
+        out[family] = rows
+    return out
 
 
 @torch.no_grad()
