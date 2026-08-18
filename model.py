@@ -108,7 +108,14 @@ class VisionTokenEncoder(nn.Module):
         return tokens
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention mechanism."""
+    """Multi-head attention mechanism.
+
+    Attention capture is opt-in: set `store_attn = True` and every forward
+    stashes its post-softmax weights, detached, in `last_attn` (B, heads, T, T)
+    -- overwritten each call, so only the most recent forward is kept. Off by
+    default, and the hot path then pays one boolean test and nothing else (no
+    clone, no detach, no transfer). See generate_response(return_attention=True).
+    """
 
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -123,6 +130,11 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
+        # Opt-in attention capture (plain attributes, not buffers: nothing here
+        # belongs in a checkpoint).
+        self.store_attn = False
+        self.last_attn = None
+
     def forward(self, query, key, value, mask=None):
         B = query.size(0)
         Q = self.W_q(query).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
@@ -136,6 +148,8 @@ class MultiHeadAttention(nn.Module):
             scores = scores.masked_fill(~m, torch.finfo(scores.dtype).min)
 
         attn = F.softmax(scores, dim=-1)
+        if self.store_attn:
+            self.last_attn = attn.detach()
         context = torch.matmul(attn, V)
         context = context.transpose(1, 2).contiguous().view(B, -1, self.d_model)
         return self.W_o(context)
@@ -350,7 +364,7 @@ class ToyVLM(nn.Module):
 
 @torch.no_grad()
 def generate_response(model, image, question, max_length=160, return_rationale=True,
-                      temperature=0.0, return_details=False):
+                      temperature=0.0, return_details=False, return_attention=False):
     """Two-stage decoding with special tokens banned from free generation.
 
     Prompt: [BOS] <IMG_START> <IMG>xN <IMG_END> <|user|> q <|assistant|> <THINK>
@@ -375,7 +389,22 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
             'aux' as the auxiliary count heads' readout of the image alone,
             {'shape'|'color'|'size': [(name, count, prob), ...]} -- what the
             encoder believes before any reasoning happens.
+        return_attention: If True (requires return_details), also records where
+            each emitted token looked. details gains 'rationale_attn' /
+            'answer_attn': lists aligned 1:1 with 'rationale_tokens' /
+            'answer_tokens', each entry a CPU float32 tensor of shape
+            (NUM_LAYERS, NUM_HEADS, NUM_IMG_TOKENS) holding that token's
+            post-softmax attention from the query row whose logits produced it
+            to the 64 image-token key positions, in the vision encoder's
+            row-major raster order (index = grid_row * 8 + grid_col). Each row
+            is a slice of a softmax over all keys, so it sums to the fraction of
+            that head's attention spent on the image, not to 1. Costs one
+            (heads, 64) slice per layer per decoding step; off, the capture
+            machinery is inert.
     """
+    assert return_details or not return_attention, \
+        "return_attention=True is only meaningful with return_details=True"
+
     model.eval()
     device = next(model.parameters()).device
     tok = model.text_processor.tokenizer
@@ -401,6 +430,11 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
         tok.img_start_id, tok.img_end_id, tok.img_token_id,
     }
 
+    # Attention capture state. `step_attn` holds the (L, H, 64) image-attention
+    # of the most recent step_once call, for the caller to file against the
+    # token that call emitted.
+    step_attn = None
+
     def step_once(ids, allowed_special, temp=0.0):
         """Next token (and its untempered probability distribution) with every
         special token banned except allowed_special.
@@ -410,10 +444,21 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
         always the untempered softmax over the masked logits -- the model's own
         confidence, independent of how the token was drawn.
         """
+        nonlocal step_attn
         ids_pad = model.text_processor.pad_sequence(ids, MAX_SEQ_LEN)
         ids_t = torch.tensor(ids_pad, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(image.unsqueeze(0), ids_t)
         pos = min(len(ids) - 1, MAX_SEQ_LEN - 1)
+        if return_attention:
+            # Row `pos` is the query whose logits pick this token; columns
+            # IMG_POS_START..+NUM_IMG_TOKENS are the image block. Under the
+            # prefix-LM mask every post-image query row can see all 64 image
+            # keys in every layer, so no row is partially masked here.
+            s, n = IMG_POS_START, NUM_IMG_TOKENS
+            step_attn = torch.stack([
+                block.attn.last_attn[0, :, pos, s:s + n]
+                for block in model.transformer_blocks
+            ]).float().cpu()
         next_logits = logits[0, pos, :].clone()
         banned = [tid for tid in all_special_ids if tid != allowed_special]
         next_logits[banned] = float('-inf')
@@ -429,42 +474,59 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
     rationale_probs = []
     answer_probs = []
     answer_topk = []
+    rationale_attn = []
+    answer_attn = []
 
-    # Stage 1: rationale until </THINK> (sampled when temperature > 0)
-    for _ in range(max_length):
-        if len(input_ids) >= MAX_SEQ_LEN - 4:
-            break  # leave room for </THINK> <FINAL> answer </FINAL>
-        nxt, probs = step_once(input_ids, allowed_special=tok.think_end_id, temp=temperature)
-        input_ids.append(nxt)
-        if nxt == tok.think_end_id:
-            break
-        rationale_tokens.append(nxt)
-        rationale_probs.append(float(probs[nxt]))
-    if input_ids[-1] != tok.think_end_id:
-        input_ids.append(tok.think_end_id)
+    if return_attention:
+        for block in model.transformer_blocks:
+            block.attn.store_attn = True
+    try:
+        # Stage 1: rationale until </THINK> (sampled when temperature > 0)
+        for _ in range(max_length):
+            if len(input_ids) >= MAX_SEQ_LEN - 4:
+                break  # leave room for </THINK> <FINAL> answer </FINAL>
+            nxt, probs = step_once(input_ids, allowed_special=tok.think_end_id, temp=temperature)
+            input_ids.append(nxt)
+            if nxt == tok.think_end_id:
+                break
+            rationale_tokens.append(nxt)
+            rationale_probs.append(float(probs[nxt]))
+            if return_attention:
+                rationale_attn.append(step_attn)
+        if input_ids[-1] != tok.think_end_id:
+            input_ids.append(tok.think_end_id)
 
-    input_ids.append(tok.final_start_id)
+        input_ids.append(tok.final_start_id)
 
-    # Stage 2: answer until </FINAL>
-    for step in range(max_length):
-        if len(input_ids) >= MAX_SEQ_LEN - 1:
-            break
-        nxt, probs = step_once(input_ids, allowed_special=tok.final_end_id)
-        if return_details and step == 0:
-            # Top alternatives at the first answer position: for the one-word
-            # answers most types produce, this is the whole answer's
-            # distribution; for multi-word answers it is the opening word's.
-            top = torch.topk(probs, k=min(4, probs.shape[0]))
-            answer_topk = [(tok.decode([int(i)], skip_special_tokens=True), float(p))
-                           for p, i in zip(top.values, top.indices)
-                           if int(i) not in all_special_ids][:3]
-        input_ids.append(nxt)
-        if nxt == tok.final_end_id:
-            break
-        answer_tokens.append(nxt)
-        answer_probs.append(float(probs[nxt]))
-    if input_ids[-1] != tok.final_end_id:
-        input_ids.append(tok.final_end_id)
+        # Stage 2: answer until </FINAL>
+        for step in range(max_length):
+            if len(input_ids) >= MAX_SEQ_LEN - 1:
+                break
+            nxt, probs = step_once(input_ids, allowed_special=tok.final_end_id)
+            if return_details and step == 0:
+                # Top alternatives at the first answer position: for the one-word
+                # answers most types produce, this is the whole answer's
+                # distribution; for multi-word answers it is the opening word's.
+                top = torch.topk(probs, k=min(4, probs.shape[0]))
+                answer_topk = [(tok.decode([int(i)], skip_special_tokens=True), float(p))
+                               for p, i in zip(top.values, top.indices)
+                               if int(i) not in all_special_ids][:3]
+            input_ids.append(nxt)
+            if nxt == tok.final_end_id:
+                break
+            answer_tokens.append(nxt)
+            answer_probs.append(float(probs[nxt]))
+            if return_attention:
+                answer_attn.append(step_attn)
+        if input_ids[-1] != tok.final_end_id:
+            input_ids.append(tok.final_end_id)
+    finally:
+        # Leave capture off however this exits, and drop the last (B,h,T,T)
+        # buffers so they do not outlive the call.
+        if return_attention:
+            for block in model.transformer_blocks:
+                block.attn.store_attn = False
+                block.attn.last_attn = None
 
     rationale = tok.decode(rationale_tokens, skip_special_tokens=True)
     answer = tok.decode(answer_tokens, skip_special_tokens=True)
@@ -479,6 +541,9 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
             'answer_topk': answer_topk,
             'aux': read_aux_counts(model, image),
         }
+        if return_attention:
+            details['rationale_attn'] = rationale_attn
+            details['answer_attn'] = answer_attn
         return rationale, answer, details
     return (rationale, answer) if return_rationale else answer
 
