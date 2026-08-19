@@ -4,8 +4,15 @@ A small, from-scratch vision-language model that answers questions about
 2D shape scenes by first writing out a step-by-step rationale and then a
 final answer -- a frontier-parallel design (inline image tokens, prefix-LM
 attention, enumerate-then-reason CoT, mixed-difficulty curriculum, auxiliary
-perception heads) shrunk down to a toy scale that trains in minutes to hours
-on a single GPU.
+perception heads, rejection-sampling fine-tuning) shrunk down to a toy scale
+that trains in minutes to hours on a single GPU.
+
+Current champion: **98.4% answer exact-match over 14 question types**
+(95.7% of rationales exactly reproduce the oracle trace), including 99.2%
+on dense-rank ordinal questions -- the type that spent most of the project
+stuck near 60%. How it got there, including the update-rule comparisons
+and trace-format findings that did and didn't work, is written up in
+[HISTORY.md](HISTORY.md).
 
 ## Architecture
 
@@ -25,10 +32,11 @@ on a single GPU.
   ```
 - **Prefix-LM attention**: bidirectional self-attention within the image
   prefix (positions 0..66), causal thereafter.
-- **`MAX_SEQ_LEN = 192`**; a 73-token deterministic vocabulary built from
+- **`MAX_SEQ_LEN = 256`**; a 95-token deterministic vocabulary built from
   the question generator's declared word set (`text.py`,
   `tokenizer.build_vocab_from_rationales`) -- training can never see an
-  out-of-vocabulary token.
+  out-of-vocabulary token, and a checkpoint is always paired with the
+  vocabulary it was trained on (the loaders check).
 - **Weight-tied output head**: the LM head shares weights with the token
   embedding.
 - **Auxiliary heads**: per-shape, per-size, and per-color count classifiers
@@ -37,24 +45,33 @@ on a single GPU.
 
 ## Data
 
-Scenes are synthesized on the fly (`shapes.py`): 64x64 RGB images, 1-6
+Scenes are synthesized on the fly (`shapes.py`): 64x64 RGB images, 1-12
 objects per scene (`MIN_OBJECTS`/`MAX_OBJECTS`), each object one of
 **4 shapes** (square, circle, cross, triangle) x **4 colors** (red, green,
 blue, yellow) x **3 sizes** (small, medium, large), placed without overlap.
 All spatial ground truth is derived from a quantized 8x8 grid (`grid_row`/
 `grid_col`), never from raw pixel coordinates.
 
-`questions.py` generates 8 question types across 3 difficulty tiers
+`questions.py` generates 14 question types across 3 difficulty tiers
 (`DIFFICULTY_MAP`), each with an *enumerate-then-reason* CoT rationale:
-first enumerate the objects the question needs (in raster order, with
-quantized grid coordinates), then perform the reasoning steps that lead to
-the answer. Yes/no questions are balanced to a roughly 50/50 answer prior.
+first enumerate the objects the question needs (with quantized grid
+coordinates), then perform the reasoning steps that lead to the answer.
+The gold trace is a deterministic function of (question, scene), which is
+what makes exact verification -- and rejection-sampling fine-tuning --
+possible. Yes/no questions are balanced to a roughly 50/50 answer prior.
 
 | Difficulty | Question types |
 |---|---|
 | easy | existence, positional_existence |
-| medium | counting, size, relative_position, side_count_comparison |
-| hard | comparison, compositional |
+| medium | counting, size, relative_position, side_count_comparison, parity |
+| hard | comparison, compositional h2/h3/h4, count_difference, ordinal, relative_count |
+
+Two robustness layers sit on top of the templates: every type is asked in
+2-4 **surface phrasings** ("is there a red square above a circle" trains
+alongside "is a red square above a circle"), and parity/comparison types
+also ask in both **polarities** (even/odd, more/fewer/equal) -- the trace
+never changes, only the answer read off it, so the model must read the
+question against the stated fact rather than copy the trace's conclusion.
 
 Example full training sequences (`<THINK>...</THINK> <FINAL>...</FINAL>`):
 
@@ -62,18 +79,25 @@ Example full training sequences (`<THINK>...</THINK> <FINAL>...</FINAL>`):
 q: is there a red shape
 <THINK> red circle at row 2 col 5 . count is 1 </THINK> <FINAL> yes </FINAL>
 
-q: how many blue triangles are there
-<THINK> blue triangle at row 6 col 5 . count is 1 </THINK> <FINAL> 1 </FINAL>
-
-q: is a circle left of a red circle
-<THINK> red circle at row 3 col 5 . blue circle at row 5 col 2 . red circle
-at row 3 col 5 . col 2 is left of col 5 . found </THINK> <FINAL> yes </FINAL>
-
-q: are there more yellow shapes than yellow squares
-<THINK> yellow square at row 3 col 5 . count of yellow shapes is 1 . yellow
-square at row 3 col 5 . count of yellow squares is 1 . 1 equal to 1
+q: are there fewer circles than squares
+<THINK> blue circle at row 5 col 2 . count of circles is 1 . yellow square
+at row 3 col 5 . count of squares is 1 . 1 equal to 1
 </THINK> <FINAL> no </FINAL>
+
+q: what shape is fourth from the right
+<THINK> rank 1 blue square at row 5 col 1 . rank 2 green circle at row 2
+col 2 . rank 3 blue cross at row 2 col 3 . rank 3 yellow cross at row 4
+col 3 . rank 4 yellow circle at row 2 col 6 . 4 ranks . fourth from right
+is rank 1 . rank 1 is square </THINK> <FINAL> square </FINAL>
 ```
+
+The ordinal trace above is the project's flagship finding: enumeration
+always sweeps ascending (columns left-to-right or rows top-to-bottom,
+whichever axis is asked), every line carries its dense-rank label as a
+local copy-or-increment, and the queried end is mapped onto the sweep by
+an explicit conversion step. Writing the ranking computation into the
+trace took the type from 60% to 99% when no amount of fine-tuning on the
+implicit format could (HISTORY.md, phases 6-9).
 
 Every generated sample is independently re-verified by `validate_traces.py`:
 every enumerated object, every stated count, and every cited witness is
@@ -98,7 +122,17 @@ out-of-vocabulary tokens or sequences that overflow `MAX_SEQ_LEN`.
   per difficulty (answer exact-match + rationale token accuracy).
 - **JSONL logging** (`train_log.jsonl` by default) and per-epoch
   checkpoints in `checkpoints/`, plus a `checkpoints/best.pth` tracked by
-  validation answer EM.
+  validation answer EM with a non-saturating rationale-accuracy tiebreak
+  (the metric saturates to exact 1.0 within epochs; strict `>` selection
+  once silently froze `best.pth` at epoch 1 -- HISTORY.md, phase 3).
+
+After base training, `onpolicy.py` + `finetune_onpolicy.py` implement
+**iterated rejection-sampling fine-tuning** (STaR): sample the model's own
+chains at temperature 1.0 (optionally hard-type-focused via `--hard_frac`),
+keep only chains that exactly reproduce the oracle trace, and fine-tune on
+the kept set mixed with fresh gold data. Each collection reports per-type
+pass@1. This recipe produced the current champion (+0.5 over its base,
+with faithfulness gains and zero forgetting, twice in a row).
 
 Default hyperparameters (`--epochs 20 --samples_per_epoch 100000
 --batch_size 128 --lr 5e-4`) target a single cloud GPU and run fine on a
@@ -129,7 +163,17 @@ uv run python train_model.py
 # Evaluate a trained checkpoint (per-question-type exact match + majority baselines)
 uv run python evaluate.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 
-# Interactive GUI: generate scenes, ask questions, see rationale + answer
+# Rejection-sampling fine-tune: collect verified own-chains, then fine-tune
+uv run python onpolicy.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json \
+    --n 50000 --temperatures 1.0 --hard_frac 0.8 --out star.pt
+uv run python finetune_onpolicy.py --init_from toy_vlm_cot.pth --onpolicy_data star.pt
+
+# Probe example: decompose ordinal errors by first divergence from the gold trace
+uv run python probe_ordinal.py --n 300
+
+# Interactive GUI: scenes with shareable seeds, confidence-tinted rationales,
+# answer alternatives, the encoder's aux-head readout, and click-any-token
+# attention overlays on the image grid
 uv run python test_model.py --checkpoint toy_vlm_cot.pth --vocab tokenizer_vocab.json
 ```
 
