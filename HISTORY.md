@@ -3,9 +3,10 @@
 A toy vision-language model with chain-of-thought reasoning over 2D shape
 scenes, built as a small-scale parallel to frontier ideas. This document
 records the full arc — including the failures, which taught more than the
-successes. Compressed into one intensive working session (2026-08-15/16):
-nine training runs, five probe studies, one project-defining bug, ~$15 of
-spot GPU.
+successes. Two intensive working sessions (2026-08-15/16 and 08-17/19):
+eleven training runs, two three-arm fine-tuning comparisons, seven probe
+studies, one project-defining bug, well under $30 of spot GPU, ending at
+98.4% overall with ordinal — the stubbornest type — at 99.2%.
 
 Companion project: [toy-vlm](https://github.com/alexlinde/toy-vlm) — the
 single-shape demonstrator this project extends.
@@ -170,34 +171,136 @@ failures it needed were exactly the discarded 10%. Overall flat
 8. **Verify subagent work, and let subagents verify yours** — the bug fell
    to routine hygiene, not brilliance.
 
-## Current state
+## Phase 5 — Robustness to how a person asks (run 10, second session,
+2026-08-17)
 
-- **GUI champion**: run 9 (92.4%, honest semantics, clarification skill),
-  `uv run python test_model.py`; scenes carry shareable seeds.
-- **Score champion**: run 8 (95.1%) archived alongside all runs in
-  `gs://toy-cot-models/` (per-run prefixes, essentials tarballs).
-- Both spot instances (L4, A100) stopped; disks retained.
-- Residual gaps: ordinal under dense-rank semantics (62.5%), deep-chain
-  faithfulness (h4 rationale exact ~41%), h3/h4 accuracy ~84%.
+A user-typed question exposed the gap: "is there a red square above the
+yellow triangle" — a phrasing the generator never produced, though every
+word of it occurred in training — made the model parse it as an existence
+question about the *yellow triangle* and answer a confident wrong "yes"
+55% of the time on scenes with no red square. On-template phrasings of
+the same question: 0–8% wrong. Fixes, all data-layer:
 
-## Proposed next step: iterated, hard-focused STaR
+- **Surface variants**: every type asks in 2–4 phrasings (`phrase()`
+  helper, canonical ~50%), validator grammar extended with alternations.
+- **Polarity variants**: parity asks even/odd, comparisons ask
+  more/fewer/equal — the trace never changes, only the answer read off it,
+  so the model must read the asked polarity against the stated fact
+  instead of copying the trace's conclusion. One new vocab word (`fewer`).
+- **Run 10** (from scratch, 93-token vocab): 91.7% overall on the much
+  wider distribution. Polarity inversion learned to ~100% per polarity;
+  the missing-shape bug fell 55%→2%. Ordinal reproduced at 60.4% — the
+  gap survived, cleanly, as the next target.
 
-One round of gentle rejection sampling was a null; the frontier version of
-the recipe differs in exactly the ways round 1 lacked:
+## Phase 6 — Three update rules, round one (STaR vs DAgger vs GRPO)
 
-1. **Collect on the failure distribution**: hard-bucket questions only
-   (h3/h4, ordinal, relative_count), higher temperature (1.0), larger k
-   per prompt — hunting for the rare verified chains on questions the
-   model usually misses.
-2. **Iterate**: fine-tune → re-collect with the improved policy → repeat
-   2–3 rounds (each round's newly-solvable questions feed the next).
-3. **Keep the DAgger arm as a comparison**: corrected trajectories
-   (`--star` off) on the same failure distribution — corrections vs
-   rejection as the update rule, same budget.
-4. **Success metric**: h3/h4 rationale exact-match closing toward answer
-   accuracy (chains as true as they are fluent), and dense-rank ordinal
-   recovering toward 80%+ without semantics changes.
+Same base (run 10), same failure distribution (80% hard types), same
+~150k-rollout budget per arm; only the sample→gradient rule differed
+(PROTOCOL.md). Result: **STaR won, nothing cracked ordinal.**
 
-Infrastructure required: none — `onpolicy.py --star`, disposition
-filtering, and `finetune_onpolicy.py` are built and verified; only a
-per-type collection filter (~20 lines) is new.
+| Arm | Overall | Ordinal | Verdict |
+|---|---|---|---|
+| STaR ×3 (rejection-SFT) | 92.6 (+0.9) | 61.3 (+0.9) | only net-positive arm; h4 rationale-exact +6.2 |
+| DAgger ×3 (corrections) | 90.3 (−1.4) | 52.9 (−7.5) | net-negative: instilled spontaneous `wait` (23% of ordinal chains) with no error-detector — false alarms broke correct chains |
+| GRPO (policy gradient) | 91.5 (−0.2) | 59.6 (−0.8) | flat, but underpowered: final KL to reference 0.003 — the policy barely moved |
+
+The three-way null on ordinal (best +0.9) was the pre-registered
+signature that the bottleneck was not the training signal.
+
+## Phase 7 — The probe: chains are an encoder readout
+
+`probe_ordinal.py` (kept in the repo as the worked example): classify each
+sampled chain's *first divergence* from the deterministic gold trace, and
+failure hypotheses separate that a plain accuracy number cannot.
+Run 10, n=300: coordinate off-by-ones 0.3%, identity confusions 0% —
+**perception exonerated**. The real failures: *order* (29.7% — a real
+object, right attributes, wrong sweep position) and *rank read-off* (15%
+— wrong final step after a PERFECT enumeration; tie-group targets 29% vs
+69% singleton). Split by side: the ascending 'top' sweep (= raster order,
+the direction every other type trains) had a **0.00** order-error rate;
+the reversed sweeps carried it all (right 0.53, bottom 0.34, left 0.28).
+
+## Phase 8 — Run 11: the trace format was the bottleneck
+
+The rank-grouped raster-sweep ordinal trace carries both failing
+computations as text: one ascending sweep per axis whatever side is asked
+(`rank 3 blue cross at row 2 col 3` — dense-rank labels, local
+copy-or-increment), then `4 ranks`, an explicit conversion (`fourth from
+right is rank 1`, j = R−k+1), and a read-off that retrieves the exact
+bigram the enumeration wrote. Questions and answers unchanged
+(equivalence: 3000 draws, 0 mismatches); vocab +`rank`/`ranks`; decode
+cap 80→160 (the new traces run to 141 tokens).
+
+**Ordinal 60.4 → 99.2%** — 100% at every density bucket from N=3 up —
+and the whole model rose to **97.9%** (h3 +8.7, relative_count +15.9,
+h4 rationale-exact 47→78). Two confounds checked and dismissed: the
+decode-cap raise explains ~none of it (run-10 re-eval at cap 160: 91.4 vs
+91.7), so the spillover is real training dynamics — removing ordinal's
+~40%-noise gradient from the hard bucket helped every other hard type.
+Post-probe: conversion, rank-count and read-off errors **all zero** in
+300 chains; ties 29→98%; order 29.7→3.3%.
+
+## Phase 9 — Three update rules, round two (from run 11): the 2×2
+
+Same protocol from the 97.9% base; GRPO granted its fair dose (5× lr).
+
+- **STaR wins again** — 98.4% overall, the project's best model
+  (`a11_r3`); relative_count +2.9, faithfulness up everywhere, zero
+  forgetting. The ranking replicates across bases.
+- **DAgger's damage was dose**: from a strong base the collections carry
+  few corrections, spontaneous `wait` collapsed 23%→≤3%, and the arm
+  turned neutral (98.1). Mechanism confirmed, and retired.
+- **GRPO at fair dose went negative** (96.7): reward flat at 0.889,
+  faithfulness degraded (ordinal rationale-exact 96→90). From a
+  near-solved base, groups are unanimous — no advantage signal, so the
+  gradient is exploration noise. RL never paid on this toy at any dose.
+
+DAgger and GRPO were then removed from the codebase; this file and the
+git history are their record.
+
+## The GUI grew an interpretability panel
+
+Inner state the forward pass already computed, surfaced instead of
+discarded: the aux count heads' scene readout (encoder belief before any
+reasoning), per-token confidence tinting of the chain, top-3 answer
+alternatives, and a click-any-token attention overlay on the 8×8 grid
+(grounding verified: object-naming tokens' attention hits the object's
+cell 34.5% exactly, 72% within one cell; row-major mapping confirmed
+against the transposed alternative scoring exactly chance).
+
+## Lessons (second session)
+
+9. **A trace must carry every computation the answer needs.** The ranking
+   was the one computation the old ordinal trace left implicit — and no
+   update rule could compensate: three of them moved it ≤ +0.9 points,
+   while writing the computation into the trace moved it +38.
+10. **Update rules amplify what exists; they do not create.** Rejection
+    sampling needs successes to keep, corrections need a detector to
+    gate them, policy gradients need disagreement to grade. Feed any of
+    them a format that withholds the computation and they polish the
+    error.
+11. **Probe by decomposition before intervening.** The chain itself is an
+    encoder readout; classifying first divergences separated perception
+    from sweep from read-off in one afternoon and redirected the whole
+    project — away from the encoder we were about to blame.
+12. **Cheap oracle, cheap science.** Every finding above leaned on the
+    deterministic gold trace: exact verification, dense partial rewards,
+    positional error attribution. Building the verifier first (phase 1)
+    kept paying to the last day.
+
+## Current state (end of second session, 2026-08-19)
+
+- **Champion**: `a11_r3` (98.4% overall / 95.7% rationale-exact; STaR
+  round 3 from run 11), archived in
+  `gs://toy-cot-models/run-20260818-a100-arms11/`; run 11 (97.9%,
+  ordinal 99.2%) is the installed GUI pair.
+- **Pipeline**: STaR-only — `onpolicy.py` (rejection-sampling collection,
+  hard-focused, per-type pass@1 stats) + `finetune_onpolicy.py`;
+  `probe_ordinal.py` as the probe example; GUI with the
+  interpretability panel.
+- **Ops**: `toy-cot-ops` service account (no interactive auth), both spot
+  instances stopped, instance scopes fixed for direct GCS archiving,
+  linger enabled against unattended-upgrade session kills.
+- Residual gaps, for whoever picks this up: h4 rationale-exact 79%
+  against 94.6% answers, relative_count 97, and the N=1–2 ordinal
+  oddity (95% on trivial scenes vs 100% everywhere else).
