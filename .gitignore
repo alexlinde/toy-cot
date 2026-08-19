@@ -54,6 +54,10 @@ venv.bak/
 *.json
 data/
 datasets/
+# web/ is an app: its JSON is config, lockfiles, and golden test fixtures,
+# not data artifacts. Its .onnx bundle stays untracked like *.pth does --
+# export_web.py regenerates it from the local checkpoint.
+!web/**/*.json
 
 # Logs
 *.log

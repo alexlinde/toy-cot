@@ -6,13 +6,25 @@ Scenes are RGB (64, 64, 3) uint8 images on a black background. Every object
 carries a color drawn uniformly from COLORS. All spatial ground truth used by
 the question/rationale layer is derived from the quantized 8x8 grid via
 grid_row() / grid_col() -- never from raw pixel coordinates.
+
+Both the RNG draws and the rasterization here are a cross-language contract
+with the web UI (web/src/lib/shapes.ts): given the same rng, both produce
+byte-identical images and metadata. That is why shapes are filled by the
+explicit integer scanline rules below instead of PIL -- an algorithm we wrote
+down once beats replicating a C library's boundary behavior in a second
+language. All fills use INCLUSIVE bounds (x2/y2 are filled), matching what
+PIL.ImageDraw did for the square and cross; circle and triangle boundaries
+moved by single pixels in the swap (accuracy re-verified against the trained
+checkpoint at the time).
 """
 
+import math
 import numpy as np
 import random
 from enum import Enum
 from typing import List, Tuple, Dict, Any
-from PIL import Image, ImageDraw
+
+from rng import SceneRandom  # noqa: F401  (re-exported: canonical seeded-scene rng)
 
 # Image constants
 IMAGE_SIZE = 64
@@ -77,8 +89,11 @@ SIZE_RANGES = {
 
 # --- dense-scene placement tuning (see DENSE_THRESHOLD above) ---------------
 # Size categories a dense scene may draw from, and their relative weights.
+# Weights are INTEGERS (17:3 == the old 0.85:0.15) because the seeded-scene
+# RNG contract bans floats; stdlib random.choices picks identically for
+# proportional weights, so legacy training streams are unchanged.
 DENSE_SIZES = [ObjSize.SMALL, ObjSize.MEDIUM]
-DENSE_SIZE_WEIGHTS = [0.85, 0.15]
+DENSE_SIZE_WEIGHTS = [17, 3]
 # Exclusion margin added to size//2 when reserving a shape's box. The drawn
 # shape never extends further than size//2 from its center, so a margin of 1
 # still guarantees strict no-pixel-overlap (numpy's exclusive upper slice bound
@@ -92,27 +107,91 @@ DENSE_EXCLUSION_MARGIN = 1
 ATTEMPTS_PER_OBJECT = 80
 DENSE_ATTEMPTS_PER_OBJECT = 120
 
+# Draw orders for the rng contract: the index an rng.choice() call maps to a
+# value through is part of what makes a seed reproduce a scene, so the lists
+# are pinned here rather than left to enum/dict iteration in two languages.
+SHAPE_DRAW_ORDER = list(ObjType)            # square, circle, cross, triangle
+SIZE_DRAW_ORDER = list(ObjSize)             # small, medium, large
+COLOR_DRAW_ORDER = list(COLORS.keys())      # red, green, blue, yellow
+
+
+class _StdlibRng:
+    """Adapter giving module-level `random` the SceneRandom draw interface.
+
+    Default rng for callers outside the seeded-scene contract (training,
+    evaluation): their draws go through the same stdlib calls as before this
+    interface existed, so a given random.seed() still yields the exact
+    pre-existing stream.
+    """
+
+    def randint(self, a, b):
+        return random.randint(a, b)
+
+    def choice(self, seq):
+        return random.choice(seq)
+
+    def weighted_choice(self, seq, weights):
+        return random.choices(seq, weights=weights, k=1)[0]
+
+
+_STDLIB_RNG = _StdlibRng()
+
+
+# --- integer rasterizer (cross-language contract, see module docstring) -----
+
+def _fill_rect(img: np.ndarray, color, x1: int, y1: int, x2: int, y2: int):
+    """Fill an axis-aligned rectangle, bounds INCLUSIVE, clipped to canvas."""
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(IMAGE_SIZE - 1, x2), min(IMAGE_SIZE - 1, y2)
+    if x1 <= x2 and y1 <= y2:
+        img[y1:y2 + 1, x1:x2 + 1] = color
+
+
+def _fill_circle(img: np.ndarray, color, cx: int, cy: int, r: int):
+    """Fill the disk (x-cx)^2 + (y-cy)^2 <= r^2 + r, one inclusive row-span
+    per scanline: |dx| <= isqrt(r^2 + r - dy^2).
+
+    The +r slack is the classic 'rounder disk' rule: the bare <= r^2 disk has
+    width-1 rows at the cardinal extremes, which at this scale read as tiny
+    cross-like nubs (a hazard for the circle/cross distinction the cross's
+    slim-arm tuning exists to protect). With the slack the silhouette tracks
+    PIL's ellipse -- what the checkpoints were trained on -- more closely too.
+    """
+    t = r * r + r
+    for y in range(cy - r, cy + r + 1):
+        dy = y - cy
+        w = _isqrt(t - dy * dy)
+        _fill_rect(img, color, cx - w, y, cx + w, y)
+
+
+def _fill_triangle(img: np.ndarray, color, cx: int, cy: int, half: int):
+    """Fill the isoceles triangle with apex (cx, cy-half) and base corners
+    (cx +/- half, cy + half): row dy below the apex spans |dx| <= dy // 2
+    (the exact integer interpolation (half * dy) // (2 * half))."""
+    for dy in range(0, 2 * half + 1):
+        w = dy // 2
+        _fill_rect(img, color, cx - w, cy - half + dy, cx + w, cy - half + dy)
+
+
+def _isqrt(n: int) -> int:
+    """floor(sqrt(n)); named so the TS port has an explicit counterpart."""
+    return math.isqrt(n)
+
+
 class ShapeGenerator:
     """Generates simple geometric shapes as RGB images."""
 
     def _draw_single_shape(self, img: np.ndarray, shape_type: ObjType, size: int,
                            cx: int, cy: int, color_name: str) -> Dict[str, Any]:
         """Draw a single axis-aligned shape onto the RGB image and return its metadata."""
-        # Create a temporary single-channel mask image for the shape
-        shape_mask = Image.new('L', (IMAGE_SIZE, IMAGE_SIZE), 0)
-        draw = ImageDraw.Draw(shape_mask)
+        color = COLORS[color_name]
 
         if shape_type == ObjType.SQUARE:
             half = size // 2
-            x1, y1 = cx - half, cy - half
-            x2, y2 = cx + half, cy + half
-            draw.rectangle([x1, y1, x2, y2], fill=255)
+            _fill_rect(img, color, cx - half, cy - half, cx + half, cy + half)
 
         elif shape_type == ObjType.CIRCLE:
-            radius = size // 2
-            x1, y1 = cx - radius, cy - radius
-            x2, y2 = cx + radius, cy + radius
-            draw.ellipse([x1, y1, x2, y2], fill=255)
+            _fill_circle(img, color, cx, cy, size // 2)
 
         elif shape_type == ObjType.CROSS:
             # Arms must stay proportionally slim at every size so the plus
@@ -126,25 +205,13 @@ class ShapeGenerator:
             # MEDIUM/LARGE sizes (16+) unchanged from divisor 6.
             thickness = max(1, size // 7)
             length = size // 2
-            # Horizontal bar
-            hx1, hy1 = cx - length, cy - thickness
-            hx2, hy2 = cx + length, cy + thickness
-            draw.rectangle([hx1, hy1, hx2, hy2], fill=255)
-            # Vertical bar
-            vx1, vy1 = cx - thickness, cy - length
-            vx2, vy2 = cx + thickness, cy + length
-            draw.rectangle([vx1, vy1, vx2, vy2], fill=255)
+            _fill_rect(img, color, cx - length, cy - thickness,
+                       cx + length, cy + thickness)     # horizontal bar
+            _fill_rect(img, color, cx - thickness, cy - length,
+                       cx + thickness, cy + length)     # vertical bar
 
         elif shape_type == ObjType.TRIANGLE:
-            half = size // 2
-            x1, y1 = cx, cy - half  # top
-            x2, y2 = cx - half, cy + half  # bottom-left
-            x3, y3 = cx + half, cy + half  # bottom-right
-            draw.polygon([(x1, y1), (x2, y2), (x3, y3)], fill=255)
-
-        # Composite the mask onto the RGB canvas using the object's color
-        mask_np = np.array(shape_mask, dtype=np.uint8)
-        img[mask_np > 0] = COLORS[color_name]
+            _fill_triangle(img, color, cx, cy, size // 2)
 
         metadata = {
             'shape': shape_type.value,
@@ -156,14 +223,27 @@ class ShapeGenerator:
 
         return metadata
 
-    def generate_multi_shape_image(self, num_shapes: int, add_noise: bool) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    def generate_multi_shape_image(self, num_shapes: int, add_noise: bool,
+                                   rng=None) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         """Generate a 64x64 RGB image with multiple shapes and return metadata.
+
+        Args:
+            num_shapes: requested object count (rejection sampling may deliver
+                fewer; see ATTEMPTS_PER_OBJECT).
+            add_noise: add per-channel Gaussian noise (training only; draws
+                from np.random and is NOT part of the seeded-scene contract).
+            rng: draw source. None (the default) keeps the historical
+                behavior -- module-level `random`, so training/eval streams
+                under random.seed() are unchanged. The seeded-scene contract
+                (GUI seeds, web parity) passes a rng.SceneRandom instead.
 
         Returns:
             image: RGB numpy array of shape (64, 64, 3) with values 0-255
             metadata_list: List of dicts with keys
                 shape, color, size, cx, cy, size_category
         """
+        if rng is None:
+            rng = _STDLIB_RNG
 
         # Initialize RGB image (black background)
         img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
@@ -184,16 +264,17 @@ class ShapeGenerator:
         while len(metadata_list) < num_shapes and attempts < max_attempts:
             attempts += 1
 
-            # Random shape, size and color
-            shape_type = random.choice(list(ObjType))
+            # Random shape, size and color. Draw kinds, order of draws, and
+            # the *_DRAW_ORDER lists are all part of the seeded-scene
+            # contract with web/src/lib/shapes.ts.
+            shape_type = rng.choice(SHAPE_DRAW_ORDER)
             if dense:
-                size_category = random.choices(DENSE_SIZES,
-                                               weights=DENSE_SIZE_WEIGHTS, k=1)[0]
+                size_category = rng.weighted_choice(DENSE_SIZES, DENSE_SIZE_WEIGHTS)
             else:
-                size_category = random.choice(list(ObjSize))
+                size_category = rng.choice(SIZE_DRAW_ORDER)
             size_min, size_max = SIZE_RANGES[size_category]
-            size = random.randint(size_min, size_max)
-            color_name = random.choice(list(COLORS.keys()))
+            size = rng.randint(size_min, size_max)
+            color_name = rng.choice(COLOR_DRAW_ORDER)
 
             # Random position with margin (unchanged: it is what keeps objects
             # off the border cells, i.e. what defines the effective grid).
@@ -201,8 +282,8 @@ class ShapeGenerator:
             if margin >= IMAGE_SIZE // 2:
                 continue
 
-            cx = random.randint(margin, IMAGE_SIZE - margin)
-            cy = random.randint(margin, IMAGE_SIZE - margin)
+            cx = rng.randint(margin, IMAGE_SIZE - margin)
+            cy = rng.randint(margin, IMAGE_SIZE - margin)
 
             # Check overlap (no overlap allowed for clearer images)
             if dense and size_category is ObjSize.SMALL:

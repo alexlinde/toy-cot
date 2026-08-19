@@ -24,6 +24,7 @@ import torch
 from PIL import Image, ImageDraw, ImageTk
 
 from model import ToyVLM, generate_response, read_aux_counts
+from rng import SceneRandom
 from shapes import GRID_CELLS, MAX_OBJECTS, MIN_OBJECTS, ShapeGenerator
 from text import TextProcessor
 
@@ -162,20 +163,21 @@ def render_attention_overlay(scene_rgb, weights, scale: int = CANVAS_SCALE,
 
 
 def make_seeded_scene(shape_generator: ShapeGenerator, seed: int = None):
-    """Seed the RNGs and generate a scene, so it can be reproduced from the seed alone.
+    """Generate (or reproduce) a scene from a seed alone.
 
-    If `seed` is None, one is drawn first (so it can still be reported back to the
-    caller). Seeding happens immediately before the object-count draw and the image
-    generation call, so the same seed always yields the same image and metadata.
+    The whole derivation -- object-count draw included -- runs off one
+    SceneRandom(seed) stream, the cross-language contract shared with the web
+    UI (see rng.py): the same seed renders the identical scene here and in
+    the browser. Global random/np.random state is left untouched.
 
-    Returns (seed, image, metadata).
+    If `seed` is None, one is drawn first (so it can still be reported back
+    to the caller). Returns (seed, image, metadata).
     """
     if seed is None:
         seed = random.randrange(1_000_000)
-    random.seed(seed)
-    np.random.seed(seed % 2**32)
-    num_shapes = random.randint(MIN_OBJECTS, MAX_OBJECTS)
-    image, metadata = shape_generator.generate_multi_shape_image(num_shapes, False)
+    rng = SceneRandom(seed)
+    num_shapes = rng.randint(MIN_OBJECTS, MAX_OBJECTS)
+    image, metadata = shape_generator.generate_multi_shape_image(num_shapes, False, rng=rng)
     return seed, image, metadata
 
 

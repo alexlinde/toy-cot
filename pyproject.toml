@@ -9,3 +9,10 @@ dependencies = [
     "tqdm",
     "pillow",
 ]
+
+[dependency-groups]
+dev = [
+    "onnx>=1.22.0",
+    "onnxruntime>=1.29.0",
+    "onnxscript>=0.7.1",
+]
