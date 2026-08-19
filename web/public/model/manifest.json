@@ -57,8 +57,17 @@
     "num_classes": 13
   },
   "files": {
-    "step.onnx": "0675d3fd8e9f3578971a98768334dd502afd656f268ca0d786dddae4c84b878d",
-    "aux.onnx": "e7b4066e1cdbba868fff97e30c80ba6d1ae4855c340c2cb72a380fd8e2918943",
-    "vocab.json": "99c104028797251fb93b15b2f577cf86ad4ae88e84d86502eaef1c69fccb7e27"
+    "step.onnx": {
+      "sha256": "0675d3fd8e9f3578971a98768334dd502afd656f268ca0d786dddae4c84b878d",
+      "bytes": 20714340
+    },
+    "aux.onnx": {
+      "sha256": "e7b4066e1cdbba868fff97e30c80ba6d1ae4855c340c2cb72a380fd8e2918943",
+      "bytes": 1104924
+    },
+    "vocab.json": {
+      "sha256": "99c104028797251fb93b15b2f577cf86ad4ae88e84d86502eaef1c69fccb7e27",
+      "bytes": 1375
+    }
   }
 }

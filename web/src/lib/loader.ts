@@ -12,6 +12,7 @@
 import * as ort from "onnxruntime-web";
 
 import { Engine, type EngineTensor, type Session } from "./engine";
+import { resolveTotalBytes } from "./progress";
 import type { ModelManifest } from "./protocol";
 
 export interface LoadProgress {
@@ -23,7 +24,7 @@ export interface LoadProgress {
 // aux.onnx is deliberately NOT fetched up front: the UI no longer shows the
 // encoder-counts panel, so its graph loads lazily on the first 'aux' request
 // (if one ever comes) instead of costing every visitor ~1MB.
-const MODEL_FILES = ["manifest.json", "vocab.json", "step.onnx"] as const;
+const PROGRESS_FILES = ["vocab.json", "step.onnx"] as const;
 
 /** Wrap an ort session so the engine never sees an ort type. */
 export function adaptSession(session: ort.InferenceSession): Session {
@@ -48,9 +49,14 @@ export function adaptSession(session: ort.InferenceSession): Session {
 }
 
 /**
- * Fetch + instantiate the whole bundle from `${baseUrl}/model/`.
- * `onProgress` fires as stream chunks land, with the running total across all
- * four files.
+ * Fetch + instantiate the bundle from `${baseUrl}/model/`.
+ *
+ * The manifest is fetched FIRST and alone: it carries the on-disk byte size
+ * of every other file, which is the only reliable progress denominator --
+ * CDNs that compress a response (Vercel serves even step.onnx as brotli)
+ * drop Content-Length, while fetch streams report DECODED bytes, which match
+ * the manifest sizes exactly. Header-based totals remain as a fallback for a
+ * manifest that predates the `files[].bytes` field.
  */
 export async function load(
   baseUrl: string,
@@ -58,24 +64,26 @@ export async function load(
 ): Promise<Engine> {
   const base = baseUrl.replace(/\/+$/, "");
 
-  const responses = await Promise.all(
-    MODEL_FILES.map(async (file) => {
-      const url = `${base}/model/${file}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`GET ${url} failed: ${res.status} ${res.statusText}`);
-      return res;
-    }),
+  const fetchOk = async (file: string): Promise<Response> => {
+    const url = `${base}/model/${file}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`GET ${url} failed: ${res.status} ${res.statusText}`);
+    return res;
+  };
+
+  const manifest = decodeJson<ModelManifest>(
+    await (await fetchOk("manifest.json")).arrayBuffer(),
+    "manifest.json",
   );
 
-  // Content-Length is advisory: if any response withholds it we cannot report a
-  // denominator, so the UI gets totalBytes 0 and shows an indeterminate bar.
-  const sizes = responses.map((res) => {
+  const responses = await Promise.all(PROGRESS_FILES.map(fetchOk));
+
+  const headerSizes = responses.map((res) => {
     const header = res.headers.get("content-length");
     return header === null ? NaN : Number(header);
   });
-  const totalBytes = sizes.some((n) => !Number.isFinite(n))
-    ? 0
-    : sizes.reduce((a, b) => a + b, 0);
+  const totalBytes = resolveTotalBytes(manifest, PROGRESS_FILES, headerSizes);
+  onProgress?.({ loadedBytes: 0, totalBytes });
 
   let loadedBytes = 0;
   const buffers = await Promise.all(
@@ -87,8 +95,7 @@ export async function load(
     ),
   );
 
-  const [manifestBuf, vocabBuf, stepBuf] = buffers;
-  const manifest = decodeJson<ModelManifest>(manifestBuf, "manifest.json");
+  const [vocabBuf, stepBuf] = buffers;
   const vocab = decodeJson<Record<string, number>>(vocabBuf, "vocab.json");
 
   ort.env.wasm.wasmPaths = `${base}/ort/`;

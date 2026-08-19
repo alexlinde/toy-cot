@@ -356,7 +356,11 @@ def main() -> None:
         'aux_heads': {'shape': heads.shape_names, 'size': heads.size_names,
                       'color': heads.color_names,
                       'num_classes': heads.num_classes},
-        'files': {name: sha256_file(os.path.join(model_dir, name))
+        # bytes are the download-progress denominator: CDNs that compress a
+        # response drop Content-Length, so the loader can't learn totals from
+        # headers alone (fetch streams report DECODED bytes, which match these).
+        'files': {name: {'sha256': sha256_file(os.path.join(model_dir, name)),
+                         'bytes': os.path.getsize(os.path.join(model_dir, name))}
                   for name in ('step.onnx', 'aux.onnx', 'vocab.json')},
     }
     with open(os.path.join(model_dir, 'manifest.json'), 'w') as f:

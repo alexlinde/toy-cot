@@ -43,7 +43,10 @@ export interface ModelManifest {
   constants: Record<string, number>;
   special_tokens: Record<string, number>;
   aux_heads: { shape: string[]; size: string[]; color: string[]; num_classes: number };
-  files: Record<string, string>;
+  /** Per-file sha256 + size. bytes is the loader's progress denominator:
+   * compressed CDN responses carry no Content-Length, and fetch streams
+   * yield decoded bytes, which match these on-disk sizes exactly. */
+  files: Record<string, { sha256: string; bytes: number }>;
 }
 
 export type Stage = "rationale" | "answer";
