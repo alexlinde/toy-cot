@@ -1,0 +1,64 @@
+{
+  "checkpoint": "toy_vlm_cot.pth",
+  "checkpoint_sha256": "040f22d8f9c0c4b0f9a4b25a2aaf3758991191c5262a08c1c7765e5ea9712ebf",
+  "stats": {
+    "total_params": 5073151,
+    "vision_params": 139793,
+    "aux_params": 103311,
+    "transformer_params": 4738560,
+    "hidden_dim": 256,
+    "num_layers": 6,
+    "num_heads": 4,
+    "vocab_size": 95
+  },
+  "constants": {
+    "MAX_SEQ_LEN": 256,
+    "NUM_IMG_TOKENS": 64,
+    "IMG_POS_START": 2,
+    "PREFIX_LEN": 67,
+    "GRID_CELLS": 8,
+    "MIN_OBJECTS": 1,
+    "MAX_OBJECTS": 12,
+    "MAX_GEN_LEN": 160
+  },
+  "special_tokens": {
+    "<PAD>": 0,
+    "<BOS>": 1,
+    "<EOS>": 2,
+    "<UNK>": 3,
+    "<|user|>": 4,
+    "<|assistant|>": 5,
+    "<THINK>": 6,
+    "</THINK>": 7,
+    "<FINAL>": 8,
+    "</FINAL>": 9,
+    "<IMG_START>": 10,
+    "<IMG_END>": 11,
+    "<IMG>": 12
+  },
+  "aux_heads": {
+    "shape": [
+      "square",
+      "circle",
+      "cross",
+      "triangle"
+    ],
+    "size": [
+      "small",
+      "medium",
+      "large"
+    ],
+    "color": [
+      "blue",
+      "green",
+      "red",
+      "yellow"
+    ],
+    "num_classes": 13
+  },
+  "files": {
+    "step.onnx": "0675d3fd8e9f3578971a98768334dd502afd656f268ca0d786dddae4c84b878d",
+    "aux.onnx": "e7b4066e1cdbba868fff97e30c80ba6d1ae4855c340c2cb72a380fd8e2918943",
+    "vocab.json": "99c104028797251fb93b15b2f577cf86ad4ae88e84d86502eaef1c69fccb7e27"
+  }
+}

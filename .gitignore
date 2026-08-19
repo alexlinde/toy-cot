@@ -12,6 +12,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# the venv lib/ rule above must not swallow the web app's source
+!web/src/lib/
 parts/
 sdist/
 var/
