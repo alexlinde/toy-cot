@@ -73,9 +73,8 @@ BUCKET_WIDTH = 3
 # generate_response's 80-step default would cut half of them off mid-enumeration
 # and this probe would read its own truncation as an enumeration failure. The
 # real bound is the sequence budget, which leaves ~180 rationale tokens after
-# the 67-token prefix; this is that with room to spare. NOTE that evaluate.py,
-# onpolicy.py and grpo.py still default to 80 -- raise their --max_gen_len for
-# run 11 or dense-scene ordinal chains cannot be sampled at all.
+# the 67-token prefix; this is that with room to spare. evaluate.py and
+# onpolicy.py default to the same 160, for the same reason.
 MAX_GEN_LEN = 160
 
 

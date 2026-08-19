@@ -1,11 +1,11 @@
 """
-On-policy correction fine-tuning (run 6) for the Toy VLM.
+On-policy (STaR) fine-tuning for the Toy VLM.
 
 Starts from a fully trained checkpoint and continues training on a mixture of
 
-  * the on-policy correction traces collected by onpolicy.py -- the model's own
-    chains, cut at their first divergence from gold, with `wait` + the gold
-    continuation spliced in and the wrong step left unsupervised, and
+  * the rejection-sampled traces collected by onpolicy.py -- scenes and
+    questions on which the model's OWN chain agreed with gold, trained on the
+    gold trace and supervised end to end, and
   * fresh synthetic gold data from the standard pipeline, so the fine-tune does
     not drift away from the distribution it already fits.
 
@@ -18,7 +18,7 @@ None); the synthetic half keeps the perception heads alive.
 Usage:
     uv run python finetune_onpolicy.py --init_from run5/checkpoints/best.pth \
         --onpolicy_data onpolicy_data.pt --onpolicy_frac 0.5 --epochs 4 \
-        --samples_per_epoch 50000 --batch_size 128 --lr 1e-4 --correction_p 0.3 \
+        --samples_per_epoch 50000 --batch_size 128 --lr 1e-4 \
         --seed 0 --log train_log_run6.jsonl
 """
 
@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import ToyVLM
-from onpolicy import KIND_ID, KINDS
+from onpolicy import KEEP_KINDS
 from questions import RationaleGenerator
 from runtime import setup_runtime
 from text import TextProcessor
@@ -62,46 +62,41 @@ class OnPolicyBatches:
     ragged batch.
     """
 
-    def __init__(self, path: str, batch_size: int, rng: random.Random,
-                 exact_only: bool = False):
+    def __init__(self, path: str, batch_size: int, rng: random.Random):
         data = torch.load(path, map_location='cpu', weights_only=False)
         self.images = data['images']                     # (N,3,64,64) uint8
         self.input_tokens = data['input_tokens']
         self.target_tokens = data['target_tokens']
         self.rat_mask = data['rat_mask']
         self.ans_mask = data['ans_mask']
-        self.disposition = data.get('disposition')        # (N,) int8, or None
+        self.disposition = data['disposition']            # (N,) int8
         self.stats = data.get('stats', {})
-        n_loaded = self.input_tokens.shape[0]
-
-        if self.disposition is not None:
-            counts = torch.bincount(self.disposition.to(torch.long), minlength=len(KINDS))
-            breakdown = {KINDS[i]: int(counts[i]) for i in range(len(KINDS))}
-        else:
-            breakdown = '(no disposition tensor in this file)'
-        print(f"On-policy disposition breakdown ({n_loaded} samples): {breakdown}")
-
-        if exact_only:
-            # Datasets collected WITH --star already contain only exact/
-            # early_stop samples; --exact_only is for filtering a dataset
-            # collected WITHOUT --star down to the strictly on-policy-correct
-            # 'exact' samples at load time.
-            assert self.disposition is not None, (
-                f"[finetune] --exact_only requires a 'disposition' tensor in "
-                f"{path}, but this file has none -- it was collected with an "
-                f"older onpolicy.py. Re-collect with the current onpolicy.py "
-                f"(or drop --exact_only) to proceed.")
-            keep = self.disposition == KIND_ID['exact']
-            self.images = self.images[keep]
-            self.input_tokens = self.input_tokens[keep]
-            self.target_tokens = self.target_tokens[keep]
-            self.rat_mask = self.rat_mask[keep]
-            self.ans_mask = self.ans_mask[keep]
-            self.disposition = self.disposition[keep]
-            print(f"--exact_only: kept {self.input_tokens.shape[0]}/{n_loaded} "
-                  f"'exact' samples")
-
         self.n = self.input_tokens.shape[0]
+
+        # The file carries its own int8 -> name legend, so the breakdown is read
+        # off the data rather than assuming this process's KINDS ordering -- a
+        # file written by a different vintage of onpolicy.py decodes correctly
+        # and then fails the contract check below instead of silently training
+        # on the wrong dispositions.
+        kind_names = data['kind_names']
+        counts = torch.bincount(self.disposition.to(torch.long),
+                                minlength=len(kind_names))
+        assert counts.numel() == len(kind_names), (
+            f"[finetune] {path} holds disposition ids past the end of its own "
+            f"{len(kind_names)}-name legend {kind_names}")
+        breakdown = {name: int(counts[i]) for i, name in enumerate(kind_names)
+                     if counts[i]}
+        print(f"On-policy disposition breakdown ({self.n} samples): {breakdown}")
+
+        # Every trace this trainer touches is supervised end to end: the loss
+        # below weights the whole rationale span, so a partially supervised
+        # trace would be trained as if its unsupervised part were gold.
+        unexpected = sorted(set(breakdown) - set(KEEP_KINDS))
+        assert not unexpected, (
+            f"[finetune] {path} contains {unexpected} samples; this trainer "
+            f"only accepts fully gold-supervised dispositions {list(KEEP_KINDS)}. "
+            f"Re-collect with the current onpolicy.py.")
+
         assert self.n >= batch_size, (
             f"[finetune] {self.n} on-policy samples cannot fill a batch of {batch_size}")
         self.batch_size = batch_size
@@ -161,8 +156,7 @@ def finetune(model, text_processor, runtime, onpolicy, args):
 
     for epoch in range(args.epochs):
         dataset = ShapeDataset(args.samples_per_epoch, text_processor,
-                               mixture=FINETUNE_MIXTURE, use_cot=True,
-                               correction_p=args.correction_p)
+                               mixture=FINETUNE_MIXTURE, use_cot=True)
         dl_kwargs = {k: v for k, v in runtime["dataloader_kwargs"].items() if v is not None}
         if args.num_workers is not None:
             dl_kwargs['num_workers'] = args.num_workers
@@ -309,8 +303,6 @@ def main():
     parser.add_argument("--samples_per_epoch", type=int, default=50_000)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--correction_p", type=float, default=0.3,
-                        help="synthetic-batch probability of an injected error + correction")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val_samples", type=int, default=256,
                         help="validation samples per difficulty")
@@ -318,10 +310,6 @@ def main():
     parser.add_argument("--num_workers", type=int, default=None,
                         help="override the runtime's dataloader worker count")
     parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--exact_only", action="store_true",
-                        help="filter the on-policy pool to disposition=='exact' "
-                             "at load time (for datasets collected WITHOUT "
-                             "--star); requires a 'disposition' tensor")
     args = parser.parse_args()
 
     assert 0.0 <= args.onpolicy_frac <= 1.0, "--onpolicy_frac must be a probability"
@@ -349,8 +337,7 @@ def main():
     print(f"Initialized from {args.init_from}")
 
     onpolicy = OnPolicyBatches(args.onpolicy_data, args.batch_size,
-                               random.Random(args.seed + 2),
-                               exact_only=args.exact_only)
+                               random.Random(args.seed + 2))
     if onpolicy.stats:
         print(f"On-policy data: {onpolicy.n} samples, counts {onpolicy.stats.get('counts')}")
 

@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from shapes import ShapeGenerator, MIN_OBJECTS, MAX_OBJECTS
 from questions import RationaleGenerator, DIFFICULTY_MAP
-from text import TextProcessor, SimpleTokenizer, MAX_SEQ_LEN
+from text import TextProcessor, SimpleTokenizer
 from model import ToyVLM, generate_response, generate_response_self_consistent
 
 

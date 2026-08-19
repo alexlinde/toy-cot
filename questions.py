@@ -30,7 +30,6 @@ Trace conventions
                          / ``rank {j} is {shape} and {shape}``
                          (a tied rank names every distinct shape it holds)
 * unresolvable referent: ``ambiguous`` (answer ``which {desc}``)
-* correction:            ``wait`` (see inject_correction)
 
 All spatial ground truth is computed from the quantized grid coordinates
 (shapes.grid_row / shapes.grid_col), never from raw pixel centers.
@@ -524,77 +523,24 @@ def _fits(candidate: Tuple[str, str, str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Error-injected correction traces
+# Trace steps
 # ---------------------------------------------------------------------------
-# inject_correction rewrites a gold trace so that one enumeration fact is stated
-# wrongly, caught, and restated correctly:
-#
-#     ... . red circle at row 2 col 5 . wait . red circle at row 3 col 5 . ...
-#          `-------- corrupted --------'         `-------- original --------'
-#
-# The corrupted step is returned as an *unsupervised* segment: its tokens are in
-# the context the model reads, but never in the rationale loss (see
-# text.prepare_input_sequence), so the model learns to recover from an error it
-# is never taught to produce.
 
 STEP_SEP = ' . '
-CORRECTION_MARKER = 'wait'
-
-# Grid coordinates a corrupted fact may name. shapes.grid_row/grid_col span
-# 0..7, but the placement margins keep every object center inside rows/cols
-# 1..6 (validate_traces reports the occupied band), so a +/-1 shift that would
-# leave the band is simply not offered: the wrong coordinate always names a cell
-# an object could really occupy, never an impossible one the model could learn
-# to spot without looking at the image.
-CORRUPT_COORD_MIN = 1
-CORRUPT_COORD_MAX = 6
-
-# Corruptions are re-drawn until the wrong fact matches *no* object in the
-# scene: a corrupted attribute may coincidentally describe a different object,
-# and such a step would be true, not an error to correct.
-CORRECTION_ATTEMPTS = 10
-
-# Words the insertion may add: the corrupted fact (7 words, 8 with a size
-# prefix, 9 with an ordinal line's 'rank {n}' label), the marker `wait`, and the
-# two ' . ' separators that frame it -- 13 at most (11 before the labeled
-# ordinal format). WORD_BUDGET guarantees a fitting sample *without* the
-# insertion, so inject_correction declines whenever the base draw is within this
-# reserve of the budget. The margin (16 - 13) is slack, not a second budget.
-CORRECTION_RESERVE = 16
-
-# WORD_BUDGET bounds question + answer + rationale together, and the longest
-# gold draws already sit exactly on it (a dense compositional_h4 sample tokenizes
-# to all 256 positions), so a guard that looked at the rationale alone would let
-# ~0.3% of injections overflow the context. inject_correction therefore also
-# charges the words spent outside the rationale: a caller that knows them passes
-# `reserved_words`, and a caller that does not is charged this worst case.
-# 32 = the longest question the generators can build plus a one-word answer.
-# The longest question is a depth-4 chain in its 'is there a' surface form,
-# every descriptor a color+shape pair and every relation two words:
-# 'is there a {D1} {r1} the {D2}' = 10 words, then ' that is {r} the {D}' = 7
-# per extra hop, so 10 + 3*7 = 31. (The canonical 'is a ...' form is one word
-# shorter, which is where the previous value of 31 came from.) No other type
-# comes close: the longest non-chain question is count_difference at 16 words
-# (17 with its answer), and the longest answer -- an ordinal rank naming four
-# tied shapes, 7 words -- rides on an 8-word question, 15 in total.
-# validate_traces asserts no sample ever exceeds it.
-QUESTION_RESERVE = 32
 
 _SIZE_ALT = '|'.join(SIZE_NAMES)
 _COLOR_ALT = '|'.join(COLOR_NAMES)
 _SHAPE_ALT = '|'.join(SHAPE_NAMES)
 # Enumeration fact, with the optional size prefix used by the `size` type and
 # the optional 'rank {n}' label used by the ordinal type. The label is *not*
-# part of the fact: parse_fact and fact_text speak the bare fact, and
-# inject_correction splits the label off before corrupting and puts the same
-# label back, so a corrupted ordinal line stays in the format its neighbours are
-# in and the only thing that differs about it is the attribute that was changed.
+# part of the fact: it is a claim about the sweep rather than about an object,
+# so parse_fact accepts it and speaks the bare fact.
 ENUM_FACT = re.compile(
     rf"(?:{RANK_WORD} (?P<label>\d) )?"
     rf"(?:(?P<size>{_SIZE_ALT}) )?(?P<color>{_COLOR_ALT}) (?P<shape>{_SHAPE_ALT})"
     rf" at row (?P<row>\d) col (?P<col>\d)")
 
-# A corrupted fact as (size, color, shape, row, col); size is None or a word.
+# An enumeration fact as (size, color, shape, row, col); size is None or a word.
 Fact = Tuple[Optional[str], str, str, int, int]
 
 
@@ -603,148 +549,19 @@ def split_steps(rationale: str) -> List[str]:
     return rationale.split(STEP_SEP)
 
 
-def join_steps(steps: Sequence[str]) -> str:
-    """Inverse of split_steps: no doubled, no missing separators."""
-    return STEP_SEP.join(steps)
-
-
-def fact_text(fact: Fact) -> str:
-    """Render an enumeration fact back into its trace step (no rank label)."""
-    size, color, shape, row, col = fact
-    prefix = f"{size} " if size is not None else ''
-    return f"{prefix}{color} {shape} at row {row} col {col}"
-
-
 def parse_fact(step: str) -> Optional[Fact]:
     """Parse an enumeration step, or None if the step is not one.
 
     An ordinal line's 'rank {n}' label is accepted and ignored: what a fact
     asserts about the scene is the object and its cell, and the label is a claim
     about the sweep instead (validate_traces checks it against the recomputed
-    dense rank). Use split_label when the label itself matters.
+    dense rank).
     """
     m = ENUM_FACT.fullmatch(step)
     if m is None:
         return None
     return (m.group('size'), m.group('color'), m.group('shape'),
             int(m.group('row')), int(m.group('col')))
-
-
-def split_label(step: str) -> Tuple[str, str]:
-    """Split an enumeration step into its rank label ('' if none) and the fact.
-
-    ``'rank 3 blue cross at row 2 col 3'`` -> ``('rank 3 ', 'blue cross at row
-    2 col 3')``; the two pieces concatenate back to the step exactly.
-    """
-    m = ENUM_FACT.fullmatch(step)
-    if m is None or m.group('label') is None:
-        return '', step
-    prefix = f"{RANK_WORD} {m.group('label')} "
-    return prefix, step[len(prefix):]
-
-
-def corruption_options(fact: Fact) -> List[Fact]:
-    """Every single-attribute corruption of `fact` that stays well-formed.
-
-    Exactly one attribute changes: the row or column by +/-1 (clamped to the
-    occupied grid band, so the shifted coordinate is always a cell an object
-    could really sit in), the color, or the shape.
-    """
-    size, color, shape, row, col = fact
-    options: List[Fact] = []
-    for r in (row - 1, row + 1):
-        if CORRUPT_COORD_MIN <= r <= CORRUPT_COORD_MAX:
-            options.append((size, color, shape, r, col))
-    for c in (col - 1, col + 1):
-        if CORRUPT_COORD_MIN <= c <= CORRUPT_COORD_MAX:
-            options.append((size, color, shape, row, c))
-    options += [(size, other, shape, row, col)
-                for other in COLOR_NAMES if other != color]
-    options += [(size, color, other, row, col)
-                for other in SHAPE_NAMES if other != shape]
-    return options
-
-
-def fact_names_an_object(fact: Fact, metadata_list: Sequence[Dict[str, Any]]) -> bool:
-    """True iff some object in the scene could make `fact` true.
-
-    The size prefix is deliberately ignored: a line that names a real object of
-    a different size still half-describes the scene, and an injected error must
-    be unambiguously false.
-    """
-    _size, color, shape, row, col = fact
-    return any(m['color'] == color and m['shape'] == shape
-               and cell_of(m) == (row, col) for m in metadata_list)
-
-
-def inject_correction(rationale: str, metadata_list: Sequence[Dict[str, Any]],
-                      rng=random, reserved_words: Optional[int] = None
-                      ) -> Optional[List[Tuple[str, bool]]]:
-    """Corrupt one enumeration fact of `rationale` and correct it right after.
-
-    Returns segments ``[(text, supervised), ...]`` whose concatenation is the
-    corrected trace, with the corrupted step -- and only the corrupted step --
-    marked unsupervised. Returns None (caller falls back to the plain rationale)
-    when the trace has no enumeration fact, when no corruption of the chosen
-    fact is unambiguously false, or when the insertion would not fit the
-    sequence budget.
-
-    Args:
-        rationale: a gold trace, ' . '-separated steps.
-        metadata_list: the scene, used to keep the injected error genuinely wrong.
-        rng: source of randomness (anything with .choice).
-        reserved_words: words the sample already spends outside the rationale
-            (question + answer). WORD_BUDGET bounds their *sum*, so passing the
-            exact figure buys back the few injections the default declines;
-            leaving it None charges the worst case (QUESTION_RESERVE), which
-            keeps the no-overflow guarantee for callers that only hold the
-            rationale.
-    """
-    if not rationale:
-        return None
-
-    steps = split_steps(rationale)
-    assert join_steps(steps) == rationale, (
-        f"[questions] step split/join round-trip failed for {rationale!r}")
-
-    candidates = [i for i, step in enumerate(steps) if ENUM_FACT.fullmatch(step)]
-    if not candidates:
-        return None
-
-    spent = QUESTION_RESERVE if reserved_words is None else reserved_words
-    if len(rationale.split()) + spent > WORD_BUDGET - CORRECTION_RESERVE:
-        return None
-
-    index = rng.choice(candidates)
-    label, fact_step = split_label(steps[index])
-    original = parse_fact(fact_step)
-    options = corruption_options(original)
-    if not options:
-        return None
-
-    corrupted = None
-    for _ in range(CORRECTION_ATTEMPTS):
-        draw = rng.choice(options)
-        if not fact_names_an_object(draw, metadata_list):
-            corrupted = draw
-            break
-    if corrupted is None:
-        return None
-
-    # Rebuild the trace around the insertion. Each piece carries the separators
-    # it owns, so the concatenation is exactly the original token stream with
-    # `{corrupted} . wait . ` spliced in front of the corrupted step's original.
-    prefix = ''.join(step + STEP_SEP for step in steps[:index])
-    corrupted_text = label + fact_text(corrupted)
-    tail = join_steps([CORRECTION_MARKER] + steps[index:])
-    segments = [(prefix, True), (corrupted_text, False), (STEP_SEP + tail, True)]
-    segments = [(text, supervised) for text, supervised in segments if text]
-
-    expected = join_steps(steps[:index] + [corrupted_text, CORRECTION_MARKER]
-                          + steps[index:])
-    assert ''.join(text for text, _ in segments) == expected, (
-        f"[questions] segment reassembly does not reproduce {expected!r}")
-    return segments
 
 
 class RationaleGenerator:
@@ -1194,8 +1011,8 @@ class RationaleGenerator:
         the model mistake a relational question for an existence question about
         the last noun it recognized. Only the head varies: the 'that is {rel}
         the {D}' hops are the same in both forms, so a chain stays parseable
-        hop by hop. This is also the longest question the generators build, and
-        QUESTION_RESERVE is derived from its 'is there a' form.
+        hop by hop. This is also the longest question the generators build: 10
+        words for the head clause plus 7 per extra hop, 31 in all.
         """
         head = phrase(f"is a {descs[0].text()}", f"is there a {descs[0].text()}")
         question = f"{head} {relations[0]} the {descs[1].text()}"
@@ -1641,9 +1458,14 @@ class RationaleGenerator:
         words.add('yes')
         words.add('no')
 
-        # self-correction marker (only ever emitted by inject_correction, but
-        # the tokenizer must know it whether or not corrections are enabled)
-        words.add(CORRECTION_MARKER)
+        # Legacy token, kept for checkpoint compatibility: 'wait' was the
+        # self-correction marker of the error-injection curriculum, which no
+        # generator emits any more. The installed checkpoints were trained with
+        # it in the vocabulary and carry an embedding row for it, so dropping
+        # the word would renumber every token id after it and make those
+        # checkpoints unloadable. No generator emits it, so validate_traces
+        # always reports it as never observed.
+        words.add('wait')
 
         # unresolvable referent: the trace marker and the ask-back answer
         # ('which red triangle' -- the descriptor words are already covered)
