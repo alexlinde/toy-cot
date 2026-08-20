@@ -17,7 +17,15 @@ describe("resolveTotalBytes", () => {
     const m = manifestWith({
       "vocab.json": { sha256: "a", bytes: 1375 },
       "step.onnx": { sha256: "b", bytes: 20714340 },
-      "aux.onnx": { sha256: "c", bytes: 1104924 },
+    });
+    expect(resolveTotalBytes(m, FILES, NO_HEADERS)).toBe(1375 + 20714340);
+  });
+
+  it("counts only the requested files, not everything the manifest lists", () => {
+    const m = manifestWith({
+      "vocab.json": { sha256: "a", bytes: 1375 },
+      "step.onnx": { sha256: "b", bytes: 20714340 },
+      "extra.bin": { sha256: "c", bytes: 1104924 },
     });
     expect(resolveTotalBytes(m, FILES, NO_HEADERS)).toBe(1375 + 20714340);
   });

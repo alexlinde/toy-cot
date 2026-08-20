@@ -10,7 +10,6 @@ The image block occupies positions 1..PREFIX_LEN-1 in every sample, so the
 attention mask is prefix-LM: bidirectional within [0, PREFIX_LEN), causal after.
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,8 +22,14 @@ HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 6
 
-# Expensive per-forward assertions (force GPU syncs); enable with TOYCOT_DEBUG=1
-DEBUG_ASSERTS = os.environ.get("TOYCOT_DEBUG", "0") == "1"
+# The forward-pass asserts below run unconditionally -- at demo scale the checks
+# are worth more than the microseconds. Three of them are marked [sync]: those
+# read a tensor's value, so `assert` forces a device synchronization and the CPU
+# stops running ahead of the GPU. Cost is ~2% on a batch-64 eager forward but
+# ~60% at batch 1 (the generation path), so a production trainer would put them
+# behind a debug flag. Under torch.compile they're free either way -- Dynamo
+# lowers them to aten._assert_async and Inductor fuses them into an existing
+# kernel, where they surface as RuntimeError rather than AssertionError.
 
 # Squeeze-and-Excitation (SE) module
 class SE(nn.Module):
@@ -78,9 +83,8 @@ class VisionTokenEncoder(nn.Module):
     def forward(self, x):
         # x: (B, 3, 64, 64) RGB in [0,1]
         B, C, H, W = x.shape
-        if DEBUG_ASSERTS:
-            assert C == 3, f"Expected RGB input with 3 channels, got {C}"
-            assert H % 8 == 0 and W % 8 == 0, "Image size should be divisible by 8 for 8x8 grid downstream."
+        assert C == 3, f"Expected RGB input with 3 channels, got {C}"
+        assert H % 8 == 0 and W % 8 == 0, "Image size should be divisible by 8 for 8x8 grid downstream."
 
         # ALWAYS add (x,y) coordinate channels
         coords = self._coord_channels(B, H, W, x.device, x.dtype)  # (B, 2, H, W)
@@ -102,9 +106,9 @@ class VisionTokenEncoder(nn.Module):
         tokens = self.drop(self.proj(tokens))  # (B, N, hidden_dim)
         tokens = self.ln(tokens)
 
-        if DEBUG_ASSERTS:
-            assert tokens.size(1) == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} vision tokens, got {tokens.size(1)}"
-            assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
+        assert tokens.size(1) == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} vision tokens, got {tokens.size(1)}"
+        # [sync] pure NaN-hunting; the first thing to gate in a real system.
+        assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
         return tokens
 
 class MultiHeadAttention(nn.Module):
@@ -113,8 +117,15 @@ class MultiHeadAttention(nn.Module):
     Attention capture is opt-in: set `store_attn = True` and every forward
     stashes its post-softmax weights, detached, in `last_attn` (B, heads, T, T)
     -- overwritten each call, so only the most recent forward is kept. Off by
-    default, and the hot path then pays one boolean test and nothing else (no
-    clone, no detach, no transfer). See generate_response(return_attention=True).
+    default. See generate_response(return_attention=True).
+
+    The two modes take different paths. Capture has to build the (T, T) matrix
+    to hand it over, so it does the math by hand; everything else defers to
+    F.scaled_dot_product_attention, which fuses the same formula and never
+    materializes that matrix. The bool mask means True = attend, which is what
+    SDPA already expects, so it passes straight through. Only the capture path
+    is exported to ONNX -- StepModel turns store_attn on for the whole graph --
+    so the browser bundle sees the hand-written math either way.
     """
 
     def __init__(self, d_model, num_heads):
@@ -135,24 +146,24 @@ class MultiHeadAttention(nn.Module):
         self.store_attn = False
         self.last_attn = None
 
-    def forward(self, query, key, value, mask=None):
-        B = query.size(0)
-        Q = self.W_q(query).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(key).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(value).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
+    def forward(self, x, mask=None):
+        # Self-attention only -- every call site passes one sequence.
+        B, T, _ = x.shape
+        Q, K, V = (proj(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+                   for proj in (self.W_q, self.W_k, self.W_v))
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        if mask is not None:
-            # mask: (T,T) bool, True = keep -> (B,h,T,T)
-            m = mask[None, None, :, :]
-            scores = scores.masked_fill(~m, torch.finfo(scores.dtype).min)
-
-        attn = F.softmax(scores, dim=-1)
         if self.store_attn:
+            scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_k)
+            if mask is not None:
+                # mask: (T,T) bool, True = keep; broadcasts over (B, h, T, T).
+                scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            attn = F.softmax(scores, dim=-1)
             self.last_attn = attn.detach()
-        context = torch.matmul(attn, V)
-        context = context.transpose(1, 2).contiguous().view(B, -1, self.d_model)
-        return self.W_o(context)
+            context = attn @ V
+        else:
+            context = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
+
+        return self.W_o(context.transpose(1, 2).reshape(B, T, self.d_model))
 
 
 class TransformerBlock(nn.Module):
@@ -174,7 +185,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, mask=None):
         h = self.norm1(x)
-        x = x + self.attn_drop(self.attn(h, h, h, mask))
+        x = x + self.attn_drop(self.attn(h, mask))
         x = x + self.resid_drop(self.ffn(self.norm2(x)))
         return x
 
@@ -280,7 +291,7 @@ class ToyVLM(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
         # Prefix-LM mask: bidirectional within the fixed image prefix, causal after.
-        causal = ~torch.triu(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool), diagonal=1)
+        causal = torch.tril(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool))
         prefix = torch.zeros(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool)
         prefix[:PREFIX_LEN, :PREFIX_LEN] = True
         self.register_buffer("attn_mask", causal | prefix, persistent=False)
@@ -333,10 +344,12 @@ class ToyVLM(nn.Module):
         token_embeds = self.token_embedding(input_tokens)  # [B, T, H]
 
         # 3) Splice visual tokens into the fixed image-block positions
-        if DEBUG_ASSERTS:
-            assert seq_len >= s + n, f"sequence too short for image block: {seq_len}"
-            assert (input_tokens[:, s:s + n] == tok.img_token_id).all(), \
-                "[model] <IMG> placeholders not at fixed positions - layout mismatch"
+        assert seq_len >= s + n, f"sequence too short for image block: {seq_len}"
+        # [sync] the one worth paying for even in a real system: if text.py's
+        # layout drifts from what we splice here, we overwrite question tokens
+        # with image tokens and train a silently broken model.
+        assert (input_tokens[:, s:s + n] == tok.img_token_id).all(), \
+            "[model] <IMG> placeholders not at fixed positions - layout mismatch"
         token_embeds[:, s:s + n, :] = img_tokens
 
         # Type embeddings: text everywhere, vision on the image block
@@ -351,8 +364,8 @@ class ToyVLM(nn.Module):
 
         # 5) Decode with prefix-LM self-attention
         logits = self.forward_with_embeds(input_embeds)
-        if DEBUG_ASSERTS:
-            assert torch.isfinite(logits).all(), "[model] NaN/Inf in logits"
+        # [sync] as above -- gate this one too in anything perf-sensitive.
+        assert torch.isfinite(logits).all(), "[model] NaN/Inf in logits"
 
         aux_outputs = None
         if return_aux:
@@ -384,11 +397,8 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
             'rationale_tokens' / 'answer_tokens' as [(word, prob), ...] with
             prob the untempered softmax probability of the emitted token over
             the banned-masked logits (the model's own confidence, independent
-            of the sampling temperature); 'answer_topk' as the top-3
-            [(word, prob), ...] alternatives at the first answer position; and
-            'aux' as the auxiliary count heads' readout of the image alone,
-            {'shape'|'color'|'size': [(name, count, prob), ...]} -- what the
-            encoder believes before any reasoning happens.
+            of the sampling temperature); and 'answer_topk' as the top-3
+            [(word, prob), ...] alternatives at the first answer position.
         return_attention: If True (requires return_details), also records where
             each emitted token looked. details gains 'rationale_attn' /
             'answer_attn': lists aligned 1:1 with 'rationale_tokens' /
@@ -539,43 +549,12 @@ def generate_response(model, image, question, max_length=160, return_rationale=T
                 (tok.decode([t], skip_special_tokens=True), p)
                 for t, p in zip(answer_tokens, answer_probs)],
             'answer_topk': answer_topk,
-            'aux': read_aux_counts(model, image),
         }
         if return_attention:
             details['rationale_attn'] = rationale_attn
             details['answer_attn'] = answer_attn
         return rationale, answer, details
     return (rationale, answer) if return_rationale else answer
-
-
-@torch.no_grad()
-def read_aux_counts(model, image):
-    """The auxiliary count heads' readout of an image: the encoder's belief
-    before any reasoning happens.
-
-    Every training forward computes these heads and inference normally discards
-    them; here they are read directly off the vision tokens (no text input is
-    involved). Returns {'shape'|'color'|'size': [(name, count, prob), ...]}
-    where count is each head's argmax class and prob its softmax probability.
-
-    Args:
-        image: RGB tensor (3, 64, 64), float32 in [0,1].
-    """
-    model.eval()
-    device = next(model.parameters()).device
-    img_tokens = model.encode_image_tokens(image.to(device).unsqueeze(0))
-    aux = model.auxiliary_heads(img_tokens)
-    families = {'shape': aux['count_logits'], 'size': aux['size_count_logits'],
-                'color': aux['color_count_logits']}
-    out = {}
-    for family, heads in families.items():
-        rows = []
-        for name, logits in heads.items():
-            probs = F.softmax(logits[0], dim=-1)
-            count = int(torch.argmax(probs).item())
-            rows.append((name, count, float(probs[count])))
-        out[family] = rows
-    return out
 
 
 @torch.no_grad()

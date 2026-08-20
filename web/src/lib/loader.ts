@@ -21,9 +21,6 @@ export interface LoadProgress {
   totalBytes: number;
 }
 
-// aux.onnx is deliberately NOT fetched up front: the UI no longer shows the
-// encoder-counts panel, so its graph loads lazily on the first 'aux' request
-// (if one ever comes) instead of costing every visitor ~1MB.
 const PROGRESS_FILES = ["vocab.json", "step.onnx"] as const;
 
 /** Wrap an ort session so the engine never sees an ort type. */
@@ -105,25 +102,9 @@ export async function load(
 
   return new Engine({
     step: adaptSession(step),
-    aux: lazySession(`${base}/model/aux.onnx`, options),
     vocab,
     manifest,
   });
-}
-
-/** A Session that fetches and instantiates its graph on first run(). */
-function lazySession(url: string, options: ort.InferenceSession.SessionOptions): Session {
-  let pending: Promise<Session> | null = null;
-  return {
-    async run(feeds) {
-      pending ??= (async () => {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`GET ${url} failed: ${res.status} ${res.statusText}`);
-        return adaptSession(await ort.InferenceSession.create(await res.arrayBuffer(), options));
-      })();
-      return (await pending).run(feeds);
-    },
-  };
 }
 
 /** Drain a response body, reporting each chunk's size. */

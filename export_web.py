@@ -11,17 +11,15 @@ Outputs (under --out, default web/):
                            to the 64 image-token keys, per layer and head --
                            the same slice generate_response(return_attention)
                            captures via store_attn.
-  public/model/aux.onnx    image -> (shape (4,C), size (3,C), color (4,C))
-                           count-head logits, rows in manifest name order.
   public/model/vocab.json  copy of the tokenizer vocabulary.
   public/model/manifest.json
                            architecture stats, sequence constants, special
-                           token ids, aux head name orders, file hashes.
+                           token ids, file hashes.
   fixtures/rng.json        PCG32 + derived-draw golden vectors.
   fixtures/scenes.json     seed -> metadata + raw RGB bytes (base64) + sha256.
   fixtures/transcripts.json
                            (seed, question) -> per-token words/probs, answer
-                           top-k, aux readout, attention summaries. Produced
+                           top-k, attention summaries. Produced
                            on CPU with the real generate_response, so the TS
                            decode loop is verified end-to-end against the
                            exact code path the Python GUI uses.
@@ -40,7 +38,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model import ToyVLM, generate_response, read_aux_counts
+from model import ToyVLM, generate_response
 from rng import SceneRandom, PCG_INITSEQ
 from shapes import ShapeGenerator, MIN_OBJECTS, MAX_OBJECTS, GRID_CELLS
 from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS, IMG_POS_START, PREFIX_LEN
@@ -92,23 +90,6 @@ class StepModel(torch.nn.Module):
         return logits_row, attn_row
 
 
-class AuxModel(torch.nn.Module):
-    """Aux count-head logits per family, rows in the manifest's name order."""
-
-    def __init__(self, vlm: ToyVLM):
-        super().__init__()
-        self.vlm = vlm
-
-    def forward(self, image):
-        tokens = self.vlm.encode_image_tokens(image)
-        aux = self.vlm.auxiliary_heads(tokens)
-        heads = self.vlm.auxiliary_heads
-        shape = torch.stack([aux['count_logits'][k][0] for k in heads.shape_names])
-        size = torch.stack([aux['size_count_logits'][k][0] for k in heads.size_names])
-        color = torch.stack([aux['color_count_logits'][k][0] for k in heads.color_names])
-        return shape, size, color
-
-
 def sha256_file(path: str) -> str:
     with open(path, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -137,8 +118,6 @@ def model_stats(model: ToyVLM) -> dict:
 
 def export_onnx(model: ToyVLM, model_dir: str) -> None:
     step = StepModel(model).eval()
-    aux = AuxModel(model).eval()
-
     image = torch.zeros(1, 3, 64, 64)
     ids = torch.zeros(1, MAX_SEQ_LEN, dtype=torch.long)
     pos = torch.tensor([67], dtype=torch.long)
@@ -156,11 +135,6 @@ def export_onnx(model: ToyVLM, model_dir: str) -> None:
         input_names=['image', 'ids', 'pos'],
         output_names=['logits_row', 'attn_row'],
         opset_version=18, dynamo=True, external_data=False)
-    torch.onnx.export(
-        aux, (image,), os.path.join(model_dir, 'aux.onnx'),
-        input_names=['image'],
-        output_names=['shape_logits', 'size_logits', 'color_logits'],
-        opset_version=18, dynamo=True, external_data=False)
 
     for block in model.transformer_blocks:  # leave the model as we found it
         block.attn.store_attn = False
@@ -173,9 +147,7 @@ def check_onnx_parity(model: ToyVLM, model_dir: str, gen: ShapeGenerator) -> Non
     import onnxruntime as ort
 
     step = StepModel(model).eval()
-    aux = AuxModel(model).eval()
     step_sess = ort.InferenceSession(os.path.join(model_dir, 'step.onnx'))
-    aux_sess = ort.InferenceSession(os.path.join(model_dir, 'aux.onnx'))
     tok = model.text_processor.tokenizer
 
     worst_logit, worst_attn = 0.0, 0.0
@@ -201,12 +173,6 @@ def check_onnx_parity(model: ToyVLM, model_dir: str, gen: ShapeGenerator) -> Non
         worst_attn = max(worst_attn, float(np.abs(t_attn.numpy() - o_attn).max()))
         assert int(t_logits.argmax()) == int(np.argmax(o_logits)), \
             f"greedy token flipped between torch and ONNX (seed {seed})"
-
-        with torch.no_grad():
-            t_aux = aux(image)
-        o_aux = aux_sess.run(None, {'image': image.numpy()})
-        for t, o in zip(t_aux, o_aux):
-            worst_logit = max(worst_logit, float(np.abs(t.numpy() - o).max()))
 
     for block in model.transformer_blocks:
         block.attn.store_attn = False
@@ -284,8 +250,6 @@ def transcript_fixtures(model: ToyVLM, gen: ShapeGenerator) -> dict:
             'rationale_tokens': [[w, round(p, 6)] for w, p in details['rationale_tokens']],
             'answer_tokens': [[w, round(p, 6)] for w, p in details['answer_tokens']],
             'answer_topk': [[w, round(p, 6)] for w, p in details['answer_topk']],
-            'aux': {fam: [[name, count, round(prob, 6)] for name, count, prob in rows]
-                    for fam, rows in details['aux'].items()},
             'rationale_attn_mean': attn_summary(details['rationale_attn']),
             'answer_attn_mean': attn_summary(details['answer_attn']),
             'rationale_attn_full_first3': [
@@ -341,7 +305,6 @@ def main() -> None:
         print(f"  wrote fixtures/{name}")
 
     tok = text_processor.tokenizer
-    heads = model.auxiliary_heads
     manifest = {
         'checkpoint': os.path.basename(args.checkpoint),
         'checkpoint_sha256': sha256_file(args.checkpoint),
@@ -353,22 +316,18 @@ def main() -> None:
             'MAX_OBJECTS': MAX_OBJECTS, 'MAX_GEN_LEN': 160,
         },
         'special_tokens': {name: tid for name, tid in tok.SPECIAL_TOKENS.items()},
-        'aux_heads': {'shape': heads.shape_names, 'size': heads.size_names,
-                      'color': heads.color_names,
-                      'num_classes': heads.num_classes},
         # bytes are the download-progress denominator: CDNs that compress a
         # response drop Content-Length, so the loader can't learn totals from
         # headers alone (fetch streams report DECODED bytes, which match these).
         'files': {name: {'sha256': sha256_file(os.path.join(model_dir, name)),
                          'bytes': os.path.getsize(os.path.join(model_dir, name))}
-                  for name in ('step.onnx', 'aux.onnx', 'vocab.json')},
+                  for name in ('step.onnx', 'vocab.json')},
     }
     with open(os.path.join(model_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
 
-    for name in ('step.onnx', 'aux.onnx'):
-        size = os.path.getsize(os.path.join(model_dir, name))
-        print(f"  {name}: {size / 1e6:.1f} MB")
+    size = os.path.getsize(os.path.join(model_dir, 'step.onnx'))
+    print(f"  step.onnx: {size / 1e6:.1f} MB")
     print(f"Bundle written to {model_dir} and {fixture_dir}")
 
 

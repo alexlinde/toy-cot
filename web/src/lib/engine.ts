@@ -1,6 +1,6 @@
 /**
  * Browser inference engine: a faithful port of model.py `generate_response`
- * (temperature 0) and `read_aux_counts` over the exported ONNX graphs.
+ * (temperature 0) over the exported ONNX step graph.
  *
  * The engine never imports an onnxruntime package. It talks to whatever ran
  * the graph through the tiny structural `Session` interface below, so the
@@ -33,7 +33,7 @@ import {
   PREFIX_LEN,
   SPECIAL,
 } from "./constants";
-import type { AuxReadout, AuxRow, ModelManifest, Stage } from "./protocol";
+import type { ModelManifest, Stage } from "./protocol";
 import { Tokenizer } from "./tokenizer";
 
 /** A tensor handed to a session. Both ort packages accept these fields. */
@@ -55,7 +55,6 @@ export interface Session {
 
 export interface EngineParts {
   step: Session;
-  aux: Session;
   vocab: Record<string, number>;
   manifest: ModelManifest;
 }
@@ -104,17 +103,17 @@ export function imageToCHW(rgb: Uint8Array): Float32Array {
   return out;
 }
 
-/** Softmax over a slice, in doubles; -Infinity entries fall out as exactly 0. */
-function softmax(logits: ArrayLike<number>, offset = 0, length = logits.length): Float64Array {
+/** Softmax in doubles; -Infinity entries fall out as exactly 0. */
+function softmax(logits: ArrayLike<number>): Float64Array {
+  const length = logits.length;
   let max = -Infinity;
   for (let i = 0; i < length; i++) {
-    const v = logits[offset + i];
-    if (v > max) max = v;
+    if (logits[i] > max) max = logits[i];
   }
   const probs = new Float64Array(length);
   let sum = 0;
   for (let i = 0; i < length; i++) {
-    const e = Math.exp(logits[offset + i] - max);
+    const e = Math.exp(logits[i] - max);
     probs[i] = e;
     sum += e;
   }
@@ -139,12 +138,10 @@ export class Engine {
   readonly manifest: ModelManifest;
   readonly tokenizer: Tokenizer;
   private readonly stepSession: Session;
-  private readonly auxSession: Session;
 
-  constructor({ step, aux, vocab, manifest }: EngineParts) {
+  constructor({ step, vocab, manifest }: EngineParts) {
     assertManifest(manifest, vocab);
     this.stepSession = step;
-    this.auxSession = aux;
     this.manifest = manifest;
     this.tokenizer = new Tokenizer(vocab);
   }
@@ -262,26 +259,6 @@ export class Engine {
     };
   }
 
-  /**
-   * The auxiliary count heads' readout of the image alone -- what the encoder
-   * believes before any reasoning happens (model.py read_aux_counts).
-   */
-  async auxRead(imageRGB: Uint8Array): Promise<AuxReadout> {
-    const out = await this.auxSession.run({
-      image: {
-        type: "float32",
-        data: imageToCHW(imageRGB),
-        dims: [1, 3, IMAGE_SIZE, IMAGE_SIZE],
-      },
-    });
-    const heads = this.manifest.aux_heads;
-    return {
-      shape: readCountHead(out.shape_logits?.data, heads.shape, heads.num_classes, "shape"),
-      size: readCountHead(out.size_logits?.data, heads.size, heads.num_classes, "size"),
-      color: readCountHead(out.color_logits?.data, heads.color, heads.num_classes, "color"),
-    };
-  }
-
   /** torch.topk(probs, 4), specials dropped, first 3 kept. */
   private topAlternatives(probs: Float64Array): [string, number][] {
     const order = Array.from(probs.keys());
@@ -305,32 +282,13 @@ function joinWords(tokens: TokenRecord[]): string {
     .join(" ");
 }
 
-function readCountHead(
-  data: Float32Array | undefined,
-  names: string[],
-  numClasses: number,
-  family: string,
-): AuxRow[] {
-  if (!data) throw new Error(`aux.onnx did not return ${family}_logits`);
-  if (data.length !== names.length * numClasses) {
-    throw new Error(
-      `${family}_logits has ${data.length} floats, expected ${names.length * numClasses}`,
-    );
-  }
-  return names.map((name, row) => {
-    const probs = softmax(data, row * numClasses, numClasses);
-    const count = argmax(probs);
-    return [name, count, probs[count]] as AuxRow;
-  });
-}
-
 /**
  * Fail loudly when the bundle in public/model/ was exported from a model whose
  * shape no longer matches what this build hardcodes.
  */
 function assertManifest(manifest: ModelManifest, vocab: Record<string, number>): void {
-  if (!manifest?.constants || !manifest.stats || !manifest.aux_heads) {
-    throw new Error("manifest.json is missing constants/stats/aux_heads");
+  if (!manifest?.constants || !manifest.stats) {
+    throw new Error("manifest.json is missing constants/stats");
   }
   const expected: Record<string, number> = {
     MAX_SEQ_LEN,

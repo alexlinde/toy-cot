@@ -432,7 +432,6 @@ def main():
                         help="validation samples per difficulty")
     parser.add_argument("--log", type=str, default="train_log.jsonl")
     parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--try_fp8", action="store_true")
     parser.add_argument("--no_cot", action="store_true",
                         help="ablation: train with empty <THINK> spans")
     parser.add_argument("--init_encoder_from", type=str, default=None,
@@ -471,7 +470,7 @@ def main():
         model.vision_token_encoder.requires_grad_(False)
         print("Vision encoder frozen")
 
-    runtime = setup_runtime(prefer_compile=not args.no_compile, try_fp8=args.try_fp8)
+    runtime = setup_runtime(prefer_compile=not args.no_compile)
 
     model = train(model, text_processor, runtime, args)
 

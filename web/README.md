@@ -10,8 +10,6 @@ a Web Worker, so the site is fully static — no inference server.
 - Click (or hover, on desktop) any token of a chain to paint that token's
   attention over the 64 image cells; the layer selector averages heads per
   layer or across all layers.
-- (The Python GUI's encoder-counts panel is not shown on the web; the aux
-  graph still ships in the bundle and loads lazily if ever requested.)
 
 ## Cross-language contracts
 

@@ -4,10 +4,9 @@
  *
  * Every request runs on one promise chain, which is the whole concurrency
  * story: an 'ask' that arrives mid-decode waits its turn (the Python GUI's
- * inference lock, without the thread), and an 'aux' cannot interleave with a
- * decode either. Tokens stream out as they are emitted, each carrying its
- * attention map -- transferred, not copied, so a 1536-float buffer per token
- * costs nothing.
+ * inference lock, without the thread). Tokens stream out as they are emitted,
+ * each carrying its attention map -- transferred, not copied, so a 1536-float
+ * buffer per token costs nothing.
  */
 
 import { Engine } from "@/lib/engine";
@@ -50,18 +49,6 @@ async function handleInit(req: Extract<WorkerRequest, { type: "init" }>): Promis
   }
 }
 
-async function handleAux(req: Extract<WorkerRequest, { type: "aux" }>): Promise<void> {
-  // Aux is best-effort: the protocol has no aux-error, and a missing readout
-  // just leaves that panel empty rather than failing the ask that follows.
-  if (!engine) return;
-  try {
-    const aux = await engine.auxRead(req.imageRGB);
-    post({ type: "aux-result", sceneSeed: req.sceneSeed, aux });
-  } catch (err) {
-    console.error(`aux readout failed for scene ${req.sceneSeed}:`, message(err));
-  }
-}
-
 async function handleAsk(req: Extract<WorkerRequest, { type: "ask" }>): Promise<void> {
   if (!engine) {
     post({ type: "ask-error", id: req.id, message: "model is not loaded yet" });
@@ -85,9 +72,6 @@ ctx.onmessage = (event: MessageEvent<WorkerRequest>) => {
   switch (req.type) {
     case "init":
       enqueue(() => handleInit(req));
-      break;
-    case "aux":
-      enqueue(() => handleAux(req));
       break;
     case "ask":
       enqueue(() => handleAsk(req));

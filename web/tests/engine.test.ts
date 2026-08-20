@@ -38,7 +38,6 @@ interface TranscriptCase {
   rationale_tokens: TokenFixture[];
   answer_tokens: TokenFixture[];
   answer_topk: TokenFixture[];
-  aux: Record<"shape" | "size" | "color", [string, number, number][]>;
   rationale_attn_mean: AttnSummary[];
   answer_attn_mean: AttnSummary[];
   /** [token][layer][head][cell] for the first three rationale tokens. */
@@ -108,11 +107,8 @@ let engine: Engine;
 const timings: { label: string; ms: number; steps: number }[] = [];
 
 beforeAll(async () => {
-  const [step, aux] = await Promise.all([
-    ort.InferenceSession.create(join(MODEL_DIR, "step.onnx")),
-    ort.InferenceSession.create(join(MODEL_DIR, "aux.onnx")),
-  ]);
-  engine = new Engine({ step: adapt(step), aux: adapt(aux), vocab, manifest });
+  const step = await ort.InferenceSession.create(join(MODEL_DIR, "step.onnx"));
+  engine = new Engine({ step: adapt(step), vocab, manifest });
 }, 120_000);
 
 afterAll(() => {
@@ -134,7 +130,7 @@ describe("Engine construction", () => {
     };
     const noop: Session = { run: async () => ({}) };
     expect(
-      () => new Engine({ step: noop, aux: noop, vocab, manifest: doctored }),
+      () => new Engine({ step: noop, vocab, manifest: doctored }),
     ).toThrow(/MAX_SEQ_LEN=512.*expects 256/);
   });
 
@@ -144,7 +140,7 @@ describe("Engine construction", () => {
       stats: { ...manifest.stats, vocab_size: manifest.stats.vocab_size + 1 },
     };
     const noop: Session = { run: async () => ({}) };
-    expect(() => new Engine({ step: noop, aux: noop, vocab, manifest: doctored })).toThrow(
+    expect(() => new Engine({ step: noop, vocab, manifest: doctored })).toThrow(
       /vocab_size/,
     );
   });
@@ -168,7 +164,6 @@ describe("golden transcripts", () => {
           onAnswerTopk: (topk) => streamedTopk.push(topk),
         });
         const elapsed = performance.now() - started;
-        const aux = await engine.auxRead(imageRGB!);
 
         const steps = result.rationaleTokens.length + result.answerTokens.length;
         timings.push({ label, ms: elapsed, steps });
@@ -227,21 +222,6 @@ describe("golden transcripts", () => {
             `topk ${i} (${word}) prob ${prob} vs ${tc.answer_topk[i][1]}`,
           ).toBeLessThanOrEqual(PROB_TOL);
         });
-
-        // --- aux count heads ---------------------------------------------
-        for (const family of ["shape", "size", "color"] as const) {
-          const want = tc.aux[family];
-          const got = aux[family];
-          expect(got.map(([name, count]) => [name, count]), `aux ${family}`).toEqual(
-            want.map(([name, count]) => [name, count]),
-          );
-          got.forEach(([name, , prob], i) => {
-            expect(
-              Math.abs(prob - want[i][2]),
-              `aux ${family} ${name} prob ${prob} vs ${want[i][2]}`,
-            ).toBeLessThanOrEqual(PROB_TOL);
-          });
-        }
 
         // --- streaming matches the returned transcript --------------------
         expect(streamed.map((t) => `${t.stage}:${t.word}`)).toEqual(

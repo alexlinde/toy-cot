@@ -19,14 +19,6 @@
  *   head's attention spent on the image -- not to 1.
  */
 
-/** [name, argmaxCount, probOfThatCount] per aux head. */
-export type AuxRow = [string, number, number];
-export interface AuxReadout {
-  shape: AuxRow[];
-  size: AuxRow[];
-  color: AuxRow[];
-}
-
 export interface ModelManifest {
   checkpoint: string;
   checkpoint_sha256: string;
@@ -42,7 +34,6 @@ export interface ModelManifest {
   };
   constants: Record<string, number>;
   special_tokens: Record<string, number>;
-  aux_heads: { shape: string[]; size: string[]; color: string[]; num_classes: number };
   /** Per-file sha256 + size. bytes is the loader's progress denominator:
    * compressed CDN responses carry no Content-Length, and fetch streams
    * yield decoded bytes, which match these on-disk sizes exactly. */
@@ -64,19 +55,12 @@ export type WorkerRequest =
       sceneSeed: number;
       imageRGB: Uint8Array;
       question: string;
-    }
-  | {
-      /** Aux count-head readout for a scene (runs on scene change). */
-      type: "aux";
-      sceneSeed: number;
-      imageRGB: Uint8Array;
     };
 
 export type WorkerResponse =
   | { type: "init-progress"; loadedBytes: number; totalBytes: number }
   | { type: "ready"; manifest: ModelManifest }
   | { type: "init-error"; message: string }
-  | { type: "aux-result"; sceneSeed: number; aux: AuxReadout }
   | {
       /** One emitted token, streamed as decoding proceeds. `prob` is the
        * model's untempered confidence in the token it emitted. `attn` is the
